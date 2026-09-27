@@ -1,0 +1,13 @@
+schema_version = 1
+[server]
+listen = "127.0.0.1:0"
+[[sites]]
+id = "fuzz"
+hosts = ["localhost"]
+[[sites.routes]]
+path = "/"
+match = "exact"
+methods = ["GET"]
+action = "respond"
+status = 200
+body = "ok"

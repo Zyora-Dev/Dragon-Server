@@ -108,6 +108,47 @@ GitHub Actions passed formatting, strict Clippy and all 36 tests on Ubuntu
 One native subprocess fixture is ignored by the normal runner and explicitly
 invoked by the process tests. See [PROGRESS.md](PROGRESS.md) for the run evidence.
 
+### Extended Validation
+
+Run the resource test in isolation so other tests do not contaminate measurements:
+
+```sh
+DRAGON_SOAK_SECONDS=600 cargo test --locked --test http_integration sustained_traffic_has_bounded_resources -- --ignored --exact --nocapture
+```
+
+It warms up 20 batches, then sustains 16 concurrent clients using streamed static
+responses, chunked/pipelined requests, conflicting framing and body timeouts.
+Every five seconds it checks open descriptors and process RSS against the warmed
+baseline: at most four additional descriptors and 16 MiB RSS growth. It also
+checks response bodies, recovery and resource release after shutdown. The default
+duration is ten minutes; `DRAGON_SOAK_SECONDS` accepts 1 through 86,400 seconds.
+The test is ignored by normal runs and requires Unix descriptor inspection and `ps`.
+RSS covers the test process, including both server and clients; it is not a heap
+leak detector or a throughput benchmark.
+
+Coverage-guided fuzzing uses a separate development-only package:
+
+```sh
+rustup toolchain install nightly-2026-09-27 --profile minimal
+cargo +nightly-2026-09-27 install cargo-fuzz --version 0.13.2 --locked
+mkdir -p fuzz/corpus/ingress_policy
+cargo +nightly-2026-09-27 fuzz run ingress_policy fuzz/corpus/ingress_policy fuzz/seeds -- -max_total_time=300 -max_len=65536 -timeout=10 -rss_limit_mb=2048 -seed=20260927 -print_final_stats=1
+```
+
+The target compiles the real ingress guard and exercises byte preservation,
+progress, path/host normalization and TOML parsing/validation under AddressSanitizer.
+Generated inputs belong in the first, ignored corpus directory; checked-in seeds
+are a separate input directory. Crash artifacts remain under `fuzz/artifacts`.
+The manual **Extended validation** GitHub Actions workflow runs these same bounded
+campaigns on Linux and retains logs/artifacts for 14 days. These campaigns do not
+prove leak freedom, exhaustive protocol coverage or production readiness.
+
+On macOS, the five-minute ASan campaign completed 3,555,327 executions without a
+crash or invariant failure. The ten-minute soak passed 61,408 connections:
+descriptors stayed at 12 in all samples and fell to 10 after shutdown; RSS rose
+from a 9,568 KiB baseline to a sampled peak of 10,368 KiB. Extended Linux results
+are pending. See [PROGRESS.md](PROGRESS.md) for evidence and remaining limits.
+
 ## Current Boundaries
 
 ### Process Foundation
@@ -156,7 +197,9 @@ This is a development foundation, not a production hosting release. No TLS,
 HTTP/2, reverse proxy, CLI-managed applications, runtime adapters, config reload,
 WebSockets, FastCGI, compression, range requests or conditional caching yet.
 Windows static serving is unsupported. Linux regression tests have passed;
-fuzzing, extended soak tests and performance benchmarks remain acceptance work.
+bounded macOS fuzzing and resource-soak campaigns have passed. Extended Linux
+campaigns, longer-duration soak tests and performance benchmarks remain
+acceptance work.
 
 The [architecture specification](docs/architecture/dragon-server-specification.md)
 describes the broader roadmap; its future commands and interfaces are proposals.

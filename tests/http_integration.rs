@@ -106,6 +106,131 @@ fn body(bytes: &[u8]) -> &[u8] {
     &bytes[start..]
 }
 
+#[cfg(unix)]
+fn resource_snapshot() -> (usize, u64) {
+    let descriptor_path = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let descriptors = std::fs::read_dir(descriptor_path)
+        .unwrap()
+        .map(Result::unwrap)
+        .count();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let rss_kib = std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    (descriptors, rss_kib)
+}
+
+#[cfg(unix)]
+async fn soak_batch(harness: &Harness) {
+    let mut clients = tokio::task::JoinSet::new();
+    for client in 0..16 {
+        let address = harness.address;
+        clients.spawn(async move {
+            let (request, expected): (&[u8], usize) = match client % 4 {
+                0 => (b"GET /assets/soak.bin HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", 1),
+                1 => (b"GET /hello HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-Test: yes\r\n\r\nGET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", 2),
+                2 => (b"GET /hello HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", 0),
+                _ => (b"GET /hello HTTP/1.1\r\nHost: localhost\r\nContent-Length: 50\r\n\r\nx", 0),
+            };
+            let response = timeout(Duration::from_secs(3), async {
+                let mut socket = TcpStream::connect(address).await.unwrap();
+                for fragment in request.chunks(7) {
+                    if let Err(error) = socket.write_all(fragment).await {
+                        assert!(matches!(error.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset));
+                        break;
+                    }
+                }
+                let mut response = Vec::new();
+                let result = socket.take(262_144).read_to_end(&mut response).await;
+                if let Err(error) = result {
+                    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+                }
+                assert!(response.len() < 262_144);
+                response
+            }).await.unwrap();
+            assert_eq!(response.windows(12).filter(|part| *part == b"HTTP/1.1 200").count(), expected);
+            if client % 4 == 0 {
+                assert_eq!(body(&response), vec![0x5a; 131_073]);
+            }
+        });
+    }
+    while let Some(result) = clients.join_next().await {
+        result.unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated soak: set DRAGON_SOAK_SECONDS and run with --ignored --exact --nocapture"]
+async fn sustained_traffic_has_bounded_resources() {
+    let seconds: u64 = std::env::var("DRAGON_SOAK_SECONDS")
+        .unwrap_or_else(|_| "600".into())
+        .parse()
+        .unwrap();
+    assert!((1..=86_400).contains(&seconds));
+    let harness = Harness::start(|config| {
+        config.limits.body_timeout_ms = 150;
+        config.limits.header_timeout_ms = 150;
+    })
+    .await;
+    std::fs::write(
+        harness.directory.path().join("public/soak.bin"),
+        vec![0x5a; 131_073],
+    )
+    .unwrap();
+    for _ in 0..20 {
+        soak_batch(&harness).await;
+    }
+    let baseline = resource_snapshot();
+    let mut peak = baseline;
+    let started = std::time::Instant::now();
+    let mut next_sample = Duration::ZERO;
+    let mut batches = 0;
+    while started.elapsed() < Duration::from_secs(seconds) {
+        soak_batch(&harness).await;
+        batches += 1;
+        if started.elapsed() >= next_sample {
+            let current = resource_snapshot();
+            peak = (peak.0.max(current.0), peak.1.max(current.1));
+            assert!(
+                current.0 <= baseline.0 + 4,
+                "descriptor growth: {baseline:?} -> {current:?}"
+            );
+            assert!(
+                current.1 <= baseline.1 + 16_384,
+                "RSS growth in KiB: {baseline:?} -> {current:?}"
+            );
+            println!(
+                "soak elapsed={}s batches={batches} descriptors={} rss_kib={}",
+                started.elapsed().as_secs(),
+                current.0,
+                current.1
+            );
+            next_sample += Duration::from_secs(5);
+        }
+    }
+    let response = harness.get("GET", "/hello").await;
+    assert_eq!(status(&response), 200);
+    harness.finish().await;
+    let final_resources = resource_snapshot();
+    assert!(final_resources.0 <= baseline.0);
+    assert!(final_resources.1 <= baseline.1 + 16_384);
+    println!(
+        "soak PASS seconds={seconds} connections={} baseline={baseline:?} peak={peak:?} after_shutdown={final_resources:?}",
+        batches * 16
+    );
+}
+
 async fn malformed_exchange(address: SocketAddr, request: &[u8], fragment_size: usize) -> Vec<u8> {
     timeout(Duration::from_secs(4), async {
         let mut socket = TcpStream::connect(address).await.unwrap();
