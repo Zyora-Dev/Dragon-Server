@@ -103,8 +103,10 @@ framing across every split in selected fixtures, fragmented and pipelined reques
 premature EOF recovery, repeated concurrent connections, limits, overload,
 deadlines, CLI errors and Unix shutdown. Short deterministic regressions do not
 replace coverage-guided fuzzing, resource-leak measurement or long soak tests.
-CI runs these checks on Linux and macOS. A configured CI workflow is not evidence
-that either remote runner has passed; see [PROGRESS.md](PROGRESS.md) for results.
+GitHub Actions passed formatting, strict Clippy and all 36 tests on Ubuntu
+24.04.5 x86-64 and macOS ARM64 using Rust 1.89.0 for commit `ecc1894`.
+One native subprocess fixture is ignored by the normal runner and explicitly
+invoked by the process tests. See [PROGRESS.md](PROGRESS.md) for the run evidence.
 
 ## Current Boundaries
 
@@ -143,7 +145,7 @@ Dragon reaps its direct child, not arbitrary grandchildren. There is no traffic
 drain, readiness, restart policy, service identity or runtime adapter yet. The
 grace period bounds time before escalation, not the OS's total termination time.
 The process API is currently compiled only for Linux and macOS; these lifecycle
-tests have been run locally on macOS, not Linux. Output
+tests have passed on both platforms in GitHub Actions. Output
 draining has a one-second deadline per stream after child exit and reports
 `output_complete = false` if it times out or fails. It is not a full supervisor,
 hostile-code sandbox or crash-recovery mechanism.
@@ -153,8 +155,8 @@ hostile-code sandbox or crash-recovery mechanism.
 This is a development foundation, not a production hosting release. No TLS,
 HTTP/2, reverse proxy, CLI-managed applications, runtime adapters, config reload,
 WebSockets, FastCGI, compression, range requests or conditional caching yet.
-Windows static serving is unsupported. Linux execution, fuzzing, extended soak
-tests and performance benchmarks remain acceptance work until recorded as run.
+Windows static serving is unsupported. Linux regression tests have passed;
+fuzzing, extended soak tests and performance benchmarks remain acceptance work.
 
 The [architecture specification](docs/architecture/dragon-server-specification.md)
 describes the broader roadmap; its future commands and interfaces are proposals.

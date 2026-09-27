@@ -14,8 +14,9 @@
 - Found Hyper normalizes conflicting transfer/length headers; added bounded httparse ingress inspection to reject ambiguity before route execution, including keep-alive messages.
 - Bounded nonblocking log sink implemented; expanded checks passed: 10 real-socket tests and 2 CLI tests, including overload recovery, slow-reader timeout, SIGTERM and request-secret omission.
 - Public server construction validates configuration; its invalid-limit regression test passed.
-- Added run instructions and Linux/macOS CI workflow. Remote CI, Linux execution, fuzzing, soak tests and benchmarks have not been run.
-- Git initialized on main with origin https://github.com/Zyora-Dev/Dragon-Server.git at the user's request to run GitHub Actions. Initial source push and Ubuntu/macOS CI results are pending; the destination repository is public.
+- Added run instructions and Linux/macOS CI workflow. Remote regression checks now pass on both platforms; coverage-guided fuzzing, soak tests and benchmarks have not been run.
+- Git initialized on main with origin https://github.com/Zyora-Dev/Dragon-Server.git at the user's request to run GitHub Actions. Initial source commit ecc1894 pushed successfully to the public repository.
+- GitHub Actions [run 36317834392](https://github.com/Zyora-Dev/Dragon-Server/actions/runs/36317834392) passed for commit ecc1894281500106564324b838abb9019ae44f7d on 2026-09-27. Ubuntu 24.04.5 x86-64 and macOS ARM64 both passed formatting, strict all-target Clippy and all 36 tests using Rust 1.89.0. Each platform reports one ignored subprocess fixture that is explicitly invoked by the process tests. Job durations: Ubuntu 55 seconds, macOS 1 minute 4 seconds. This verifies the existing Linux regression suite, not production readiness or complete Phase 2 acceptance.
 - Latest local checks passed after the Phase 2 lifecycle enhancement: cargo fmt applied; cargo clippy --locked --all-targets -- -D warnings clean; cargo test --locked passed all 36 tests (9 unit, 3 configuration, 15 TCP, 2 CLI, 7 process). One subprocess fixture is ignored in normal runs and explicitly exercised by the process tests. These results are from macOS, not Linux.
 - VS Code run task added in .vscode/tasks.json. Example server running at http://127.0.0.1:8080; /hello, /assets/ and HEAD /assets/index.txt returned 200 in live smoke checks.
 - Production acceptance remains pending. No TLS, reverse proxy, complete runtime supervisor, Niral integration, deployment or distributed features implemented. The new process primitive is not connected to the CLI or HTTP configuration.
@@ -34,7 +35,7 @@
 
 - Phase 1 follow-up: three deterministic ingress tests passed across every input split and several output buffer sizes, covering ambiguous heads, forbidden trailers and chunk-line limits. This is regression coverage, not a coverage-guided fuzz campaign.
 - Static pathname-replacement/socket/index tests and TCP premature-EOF, fragmented-body and repeated-concurrency tests passed. The concurrency regression completes 256 static requests across 32 cycles of 8 clients and verifies continued availability.
-- These short deterministic checks do not establish descriptor/memory leak freedom, concurrent symlink-race coverage, coverage-guided fuzzing or long-soak stability. Linux CI execution remains required before Phase 1 acceptance.
+- These short deterministic checks do not establish descriptor/memory leak freedom, concurrent symlink-race coverage, coverage-guided fuzzing or long-soak stability. Linux CI execution is now verified; the remaining acceptance gates still apply.
 
 - Clarified ownership of HTTP serving, runtime adapters, process management, configuration, security, and deployment.
 - Documented all 21 requested architecture sections, interface proposals, configuration example, phase gates, tests, benchmarks, and risks.
