@@ -1,0 +1,20 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Dragon: Run local HTTP server",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"run",
+				"--locked",
+				"--",
+				"start",
+				"--config",
+				"examples/minimal/dragon.toml"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}

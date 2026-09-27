@@ -1,0 +1,30 @@
+schema_version = 1
+
+[server]
+listen = "127.0.0.1:8080"
+shutdown_timeout_ms = 10000
+
+[logging]
+level = "info"
+format = "json"
+
+[[sites]]
+id = "local"
+hosts = ["localhost", "127.0.0.1"]
+
+[[sites.routes]]
+path = "/hello"
+match = "exact"
+methods = ["GET", "HEAD"]
+action = "respond"
+status = 200
+content_type = "application/json"
+body = '{"message":"Hello from Dragon"}'
+
+[[sites.routes]]
+path = "/assets"
+match = "prefix"
+methods = ["GET", "HEAD"]
+action = "static"
+root = "./public"
+index = "index.txt"
