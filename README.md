@@ -104,9 +104,10 @@ premature EOF recovery, repeated concurrent connections, limits, overload,
 deadlines, CLI errors and Unix shutdown. Short deterministic regressions do not
 replace coverage-guided fuzzing, resource-leak measurement or long soak tests.
 GitHub Actions passed formatting, strict Clippy and all 36 tests on Ubuntu
-24.04.5 x86-64 and macOS ARM64 using Rust 1.89.0 for commit `ecc1894`.
-One native subprocess fixture is ignored by the normal runner and explicitly
-invoked by the process tests. See [PROGRESS.md](PROGRESS.md) for the run evidence.
+and macOS using Rust 1.89.0 for commit `6942176`.
+The normal runner ignores the separate soak test and one native subprocess
+fixture explicitly invoked by the process tests. See [PROGRESS.md](PROGRESS.md)
+for the run evidence.
 
 ### Extended Validation
 
@@ -146,8 +147,11 @@ prove leak freedom, exhaustive protocol coverage or production readiness.
 On macOS, the five-minute ASan campaign completed 3,555,327 executions without a
 crash or invariant failure. The ten-minute soak passed 61,408 connections:
 descriptors stayed at 12 in all samples and fell to 10 after shutdown; RSS rose
-from a 9,568 KiB baseline to a sampled peak of 10,368 KiB. Extended Linux results
-are pending. See [PROGRESS.md](PROGRESS.md) for evidence and remaining limits.
+from a 9,568 KiB baseline to a sampled peak of 10,368 KiB.
+On Ubuntu 24.04.5, the five-minute ASan campaign passed 2,687,267 executions;
+the ten-minute soak passed 61,888 connections. Descriptors stayed at 14 in all
+samples and fell to 12 after shutdown; RSS rose from 10,672 KiB to a sampled
+peak of 11,904 KiB. See [PROGRESS.md](PROGRESS.md) for evidence and remaining limits.
 
 ## Current Boundaries
 
@@ -197,9 +201,9 @@ This is a development foundation, not a production hosting release. No TLS,
 HTTP/2, reverse proxy, CLI-managed applications, runtime adapters, config reload,
 WebSockets, FastCGI, compression, range requests or conditional caching yet.
 Windows static serving is unsupported. Linux regression tests have passed;
-bounded macOS fuzzing and resource-soak campaigns have passed. Extended Linux
-campaigns, longer-duration soak tests and performance benchmarks remain
-acceptance work.
+bounded Linux and macOS fuzzing and resource-soak campaigns have passed.
+Longer-duration soak tests, exhaustive coverage and performance benchmarks
+remain acceptance work.
 
 The [architecture specification](docs/architecture/dragon-server-specification.md)
 describes the broader roadmap; its future commands and interfaces are proposals.
