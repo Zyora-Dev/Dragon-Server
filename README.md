@@ -103,8 +103,9 @@ framing across every split in selected fixtures, fragmented and pipelined reques
 premature EOF recovery, repeated concurrent connections, limits, overload,
 deadlines, CLI errors and Unix shutdown. Short deterministic regressions do not
 replace coverage-guided fuzzing, resource-leak measurement or long soak tests.
-GitHub Actions passed formatting, strict Clippy and all 36 tests on Ubuntu
-and macOS using Rust 1.89.0 for commit `6942176`.
+GitHub Actions passed formatting, strict Clippy and all 50 regular tests on Ubuntu
+24.04 and macOS 26 ARM64 using Rust 1.89.0 for commit `df736b0` in
+[run 37480435071](https://github.com/Zyora-Dev/Dragon-Server/actions/runs/37480435071).
 The normal runner ignores the separate soak test and one native subprocess
 fixture explicitly invoked by the process tests. See [PROGRESS.md](PROGRESS.md)
 for the run evidence.
@@ -244,8 +245,8 @@ instance. Dragon does not yet reserve that port, authenticate probe responses,
 or verify socket ownership; an unrelated local service could satisfy the probe.
 This API does not make an instance eligible for public traffic. Application
 revision/operation serialization, durable identity and adapters
-remain future work. The new readiness tests are currently verified locally on
-macOS; previous Linux CI evidence predates this layer.
+remain future work. The readiness tests pass locally on macOS and in Linux/macOS
+GitHub Actions for commit `df736b0`.
 
 ### Bounded Restarts
 
@@ -287,8 +288,9 @@ This library increment uses deterministic backoff and a strict lifetime budget.
 The specification's proposed jitter, rolling time window and stable-readiness
 budget reset are not implemented. No CLI/config wiring, continuous health checks,
 durable recovery or public forwarding was added. Eight new native restart tests,
-all 50 regular tests, formatting and strict Clippy pass locally on macOS; Linux
-validation for the application layer remains pending.
+all 50 regular tests, formatting and strict Clippy pass locally on macOS and in
+Linux/macOS GitHub Actions for commit `df736b0`. The extended fuzz/soak campaign
+was not rerun for this application-layer increment.
 
 ### Hosting Release
 
