@@ -1,13 +1,15 @@
 # Dragon Server
 
-An independent, Indian-built HTTP and application server with a locally tested
-Phase 1 HTTP foundation and initial Phase 2 process primitives. Backend hosting
-and Niral integration are not yet available features.
+An independent, Indian-built HTTP and application server with a tested HTTP
+foundation and initial managed application hosting over bounded HTTP/1.1.
+Niral production SSR, assets and browser RPC have been verified locally through
+Dragon. This is a development foundation, not a production hosting release.
 
 ## What Can Dragon Host Today?
 
-Dragon currently serves static frontends, not full-stack applications. Its Rust
-implementation does not imply support for executing Rust application code.
+Dragon serves static frontends and can launch trusted application processes that
+provide a private loopback HTTP endpoint. It does not compile application code or
+provide language runtimes.
 
 | Workload | Current support |
 | --- | --- |
@@ -15,15 +17,15 @@ implementation does not imply support for executing Rust application code.
 | TypeScript or framework-based frontend | Prebuilt browser output only; Dragon does not compile or build it |
 | Single-page application | Static assets supported; no automatic index fallback for client-side deep links |
 | Configured JSON/text endpoint | Fixed response only, not dynamic backend logic |
-| Node.js/TypeScript, Python, PHP, Java, Go, Rust or .NET backend | Not yet: no application execution, process management or reverse proxy |
-| Server-side rendering | Not yet: requires a backend runtime |
-| Niral full-stack application | Planned; runtime integration has not been inspected or implemented |
+| Backend executable with a loopback HTTP endpoint | Explicit process launch, readiness gating and bounded proxy; runtime-specific compatibility requires testing |
+| Server-side rendering | Buffered by default; opt-in streaming HTML and SSE |
+| Niral application | Production SSR, assets, hydration, guestbook RPC and session cookies verified locally; not all Niral features supported |
 
 Configure a dedicated public output directory as a static root and an explicit
 directory index such as `index.html`. Do not expose backend source or secrets as
 static files: Dragon serves files, it does not execute server-side source.
-The intended product supports frontend and backend hosting through
-language-neutral integration; that backend capability is future work.
+Backend integration is language-neutral; FastCGI, per-request interpreters and
+automatic language detection are not implemented.
 
 ## Run Locally
 
@@ -42,9 +44,40 @@ curl -I http://127.0.0.1:8080/assets/index.txt
 ```
 
 Stop with Ctrl+C or SIGTERM. Dragon stops accepting connections, drains existing
-work up to the configured shutdown deadline, then closes remaining connections.
+work up to the configured shutdown deadline, then closes remaining connections
+and stops managed applications. Application cleanup errors cause a failed exit.
 An invalid configuration exits with status 2 before binding; a bind/runtime
 failure exits with status 1.
+
+### Host Niral
+
+[examples/niral/dragon.toml](examples/niral/dragon.toml) is a template: replace its
+absolute paths with your Node executable (22+), Niral checkout, launcher and built
+application directory. Build the Niral app before starting Dragon:
+
+```sh
+node /absolute/path/to/niral/bin/niral.js build /absolute/path/to/app
+cargo run --locked -- start --config /absolute/path/to/configured-dragon.toml
+```
+
+The template serves `http://127.0.0.1:8081` through Dragon and keeps Niral on
+`127.0.0.1:8199`. The example launcher uses Niral's production API, checks required
+hook environment variables and binds explicitly to loopback. It is a local
+checkout adapter, not a stable packaged Niral integration. Its 750 ms shutdown
+grace fits within Dragon's current one-second process grace.
+
+The machine-local demo uses an isolated copy of Niral's existing site example in
+ignored `target/niral-demo/site`, with configuration in `target/niral-demo/dragon.toml`.
+The VS Code **Dragon: Run Niral demo** task starts it; these generated files must
+exist first and are removed by `cargo clean`. The source Niral checkout is not
+modified. The example's separate Python worker page has not been configured or
+verified; the Node SSR, counter and guestbook are the verified demo paths.
+
+The template enables streaming and WebSocket forwarding. An additional machine-local
+demo runs at `https://localhost:8443` with a separate backend on `127.0.0.1:8198`.
+Its generated configuration, copied site and seven-day self-signed certificate are
+under ignored `target/niral-tls-demo`. Browsers do not automatically trust this
+test certificate. The original HTTP demos are unchanged.
 
 ## Configuration
 
@@ -61,6 +94,75 @@ are denied using descriptor-relative file access. Serve only trusted, dedicated
 public directories; filesystem permissions and hard-link policy remain the
 operator's responsibility.
 
+### Managed Applications
+
+Declare up to 64 `[[applications]]` with unique `id`, a `release`, executable,
+argument array, working directory, explicit environment and readiness settings.
+Executable/cwd paths resolve relative to the TOML file; argument and environment
+strings are passed literally. No shell expansion or inherited environment is
+provided. Supply any required PATH or runtime settings explicitly. Startup does
+not run builds. Each endpoint must be numeric loopback, unique, and use a port
+different from Dragon's listener. Endpoint ownership remains an operator contract.
+
+Use `action = "proxy"` and `application = "your-id"` on a route. Proxy routes
+cannot also specify static or fixed-response fields. Dragon binds its listener,
+starts applications sequentially and waits for all to pass startup readiness
+before accepting HTTP connections. Startup failure stops previously launched
+applications. SIGINT/SIGTERM can interrupt readiness. After startup, proxy routes
+return 503 while the application is not Ready; already admitted requests can
+still fail if the application exits. Static routes remain available after an
+application exits. There are no continuous health probes.
+
+Restart defaults to `{ mode = "never" }`. Opt in with, for example:
+`restart = { mode = "on_failure", max_restarts = 3, initial_delay_ms = 100, max_delay_ms = 1000 }`.
+`always` also retries successful exits. Cleanup errors prevent replacement,
+including macOS `PermissionDenied` unless native inspection proves the group
+contains only zombies awaiting reaping.
+
+The proxy preserves method, raw path/query, Host, cookies and ordinary end-to-end
+headers. It strips hop-by-hop headers and client-supplied forwarding headers,
+sets `X-Forwarded-Host` and `X-Forwarded-Proto` to `http` or `https` according to
+the listener, and does not forward a client IP. Trailers are not forwarded.
+Request bodies and, by default, upstream responses are fully buffered within
+configured limits; size memory budgets with request concurrency.
+Each request uses one upstream connection, with no retry or pooling. Upstream
+errors/oversized responses return 502; the total upstream connect/header/body
+deadline returns 504. `response_timeout_ms` separately bounds downstream writing.
+
+Set `streaming = true` on a proxy route for streaming SSR or SSE. Responses use
+backpressure without the cumulative `max_proxy_response_bytes` cap. After headers,
+`response_timeout_ms` bounds downstream-write inactivity, not total stream duration;
+upstream failures abort the response rather than replacing it with a 502. Uploads
+remain buffered and trailers are dropped. Each stream retains its admission slot.
+
+Set `websocket = true` on a proxy route to allow validated WebSocket upgrades;
+otherwise upgrades return 501. Subprotocol selection is validated, but extensions
+are disabled. Tunnels retain connection/request admission, use bounded copy buffers
+and close after `idle_timeout_ms` without traffic in either direction. Shutdown
+closes the tunnel transport; Dragon does not generate a WebSocket close frame.
+These two flags default to false and are only valid for proxy routes.
+
+### HTTPS
+
+Add TLS settings beneath the existing server configuration:
+
+```toml
+[server.tls]
+certificate = "certificates/fullchain.pem"
+private_key = "certificates/private-key.pem"
+handshake_timeout_ms = 10000
+```
+
+PEM paths resolve relative to the configuration file. Each must be a regular file
+of at most 1 MiB; the certificate chain must contain 1 to 32 certificates matching
+the private key. Handshake timeout defaults to 10000 ms and accepts 1 to 60000 ms.
+Failed or stalled handshakes release connection admission. Rustls serves TLS 1.2/1.3
+with HTTP/1.1 ALPN; the configured listener no longer accepts plaintext HTTP.
+Streaming and WebSockets also work over TLS. Certificate issuance, renewal, reload,
+client certificates, HTTP/2 and TLS to the loopback backend are not implemented.
+Protect the key using filesystem permissions and configure application secure-cookie
+and trusted-proxy policy separately.
+
 Optional `[limits]` defaults:
 
 | Setting | Default |
@@ -71,13 +173,15 @@ Optional `[limits]` defaults:
 | max_header_bytes | 16384 |
 | max_target_bytes | 8192 |
 | max_body_bytes | 1048576 |
+| max_proxy_response_bytes | 16777216 |
 | header_timeout_ms | 10000 |
 | body_timeout_ms | 30000 |
 | response_timeout_ms | 30000 |
 | idle_timeout_ms | 15000 |
 
-`server.shutdown_timeout_ms` defaults to 10000. Deadlines bound each phase rather
-than resetting with every byte. Connection overload closes newly accepted
+`server.shutdown_timeout_ms` defaults to 10000. Ordinary HTTP deadlines bound each
+phase; streaming writes and WebSocket traffic use the inactivity rules above.
+Connection overload closes newly accepted
 sockets; request overload returns 503. Malformed framing and raw header-limit
 violations may close the connection without an HTTP error response. Conflicting
 Transfer-Encoding and Content-Length are rejected before routing, including on
@@ -108,7 +212,43 @@ GitHub Actions passed formatting, strict Clippy and all 50 regular tests on Ubun
 [run 37480435071](https://github.com/Zyora-Dev/Dragon-Server/actions/runs/37480435071).
 The normal runner ignores the separate soak test and one native subprocess
 fixture explicitly invoked by the process tests. See [PROGRESS.md](PROGRESS.md)
-for the run evidence.
+for the run evidence. The current suite passes 61 regular tests on macOS, including
+stream delivery before EOF, admission recovery, early WebSocket frames, binary/ping
+echo, shutdown, trusted/untrusted TLS, handshake timeout, secure streaming, WSS
+and macOS live/missing-group rejection during zombie inspection.
+The opt-in real Niral smoke also passes with streaming enabled. A short macOS ASan
+run replayed 3,407 corpus inputs without failure; it is not an extended protocol
+fuzz campaign. New Linux CI and extended fuzz/soak have not been run. Normal runs
+also ignore the Niral test.
+
+### Optional Niral Smoke Test
+
+With a local Niral checkout and an absolute Node executable path (Node 22+):
+
+```sh
+DRAGON_NIRAL_ROOT=/absolute/path/to/niral \
+DRAGON_NODE=/absolute/path/to/node \
+cargo test --locked --test process_integration application_niral_production_smoke -- --ignored --exact --nocapture
+```
+
+This opt-in test builds an isolated temporary Niral app, starts its production
+server through Dragon's configured application supervisor, and checks health
+readiness, server-loaded HTML, referenced production assets and 404 handling
+through Dragon's HTTP listener with streaming enabled, then checks both listeners
+close on shutdown.
+It leaves the Niral checkout and existing applications unchanged.
+The bootstrap uses Niral's production API with an explicit loopback bind rather
+than its CLI, which currently binds all interfaces; it does not exercise CLI
+startup preflight (unlike the example launcher). Browser hydration, RPC, WebSockets
+and restarts are not covered by this automated test.
+
+Verified locally on macOS with Node 25.6.1 on 2026-10-07: proxied HTTP checks passed,
+both listeners closed and cleanup returned `Ok(())`. The smoke now requires clean
+cleanup for both Niral and the test client. The previous zombie-only macOS
+`PermissionDenied` is resolved by bounded native inspection, not blanket error
+suppression. Genuine or unverified cleanup errors still prevent replacement.
+This is not complete hosting acceptance.
+The test is ignored in normal CI because Niral and Node are external prerequisites.
 
 ### Extended Validation
 
@@ -158,8 +298,8 @@ peak of 11,904 KiB. See [PROGRESS.md](PROGRESS.md) for evidence and remaining li
 
 ### Process Foundation
 
-The library now exposes `process::ProcessManager`, `ProcessSpec` and
-`ProcessHandle`. This is not yet wired into the CLI, HTTP configuration or routes.
+The library exposes `process::ProcessManager`, `ProcessSpec` and
+`ProcessHandle`. Managed HTTP hosting uses it through the application layer.
 It launches an explicit absolute executable with separate arguments and an
 absolute working directory, without an implicit shell or inherited environment.
 Callers must explicitly supply required environment variables.
@@ -183,12 +323,17 @@ Dragon's HTTP logs.
 direct child's exit status. Dragon still attempts direct-child termination and
 reaping. Inspect this field: macOS can return `PermissionDenied` for a group
 containing only zombies, but the same error may indicate surviving processes
-Dragon cannot signal. It is not silently treated as successful group cleanup.
+Dragon cannot signal. On macOS only, Dragon accepts this error when two matching
+native group enumerations include the unreaped leader and every listed member
+reports zombie status and the expected group ID. Inspection is capped at 4096
+entries; a full buffer, failed query, live member, missing leader or changed
+membership leaves the original error intact. The leader remains unreaped throughout
+inspection to prevent group-ID reuse. Linux signal handling is unchanged.
 
 This primitive is for trusted, non-daemonizing workloads only. Process groups
 are not containment: descendants can escape into other groups or sessions.
-Dragon reaps its direct child, not arbitrary grandchildren. There is no traffic
-drain, OS service identity or runtime adapter yet. Startup readiness, logical
+Dragon reaps its direct child, not arbitrary grandchildren. The primitive itself
+does not drain HTTP traffic or provide an OS service identity. Startup readiness, logical
 instance identity and restart policy belong to the application layer below. The
 grace period bounds time before escalation, not the OS's total termination time.
 The process API is currently compiled only for Linux and macOS; these lifecycle
@@ -201,7 +346,7 @@ hostile-code sandbox or crash-recovery mechanism.
 
 The Linux/macOS library exposes `application::ApplicationManager`,
 `ApplicationSpec`, `ReadinessSpec` and `ApplicationHandle`. This layer owns a
-bounded process manager; it is not wired to the CLI, TOML schema or public routing.
+bounded process manager and is used by configured application hosting.
 `start` validates the full application/readiness specification before spawning.
 Application and release IDs accept 1-128 ASCII letters, digits, dots, hyphens and
 underscores. Each application start receives a distinct process-local numeric
@@ -243,7 +388,7 @@ live process is not detected after startup. Endpoint ownership is a trusted
 operator contract: the caller must provide a private endpoint belonging to this
 instance. Dragon does not yet reserve that port, authenticate probe responses,
 or verify socket ownership; an unrelated local service could satisfy the probe.
-This API does not make an instance eligible for public traffic. Application
+The server's proxy route uses the Ready snapshot to gate public traffic. Application
 revision/operation serialization, durable identity and adapters
 remain future work. The readiness tests pass locally on macOS and in Linux/macOS
 GitHub Actions for commit `df736b0`.
@@ -279,24 +424,24 @@ from this terminal state. A replacement spawn error is terminal and reported as
 the last launched process's status and bounded output, not generation history.
 
 Any process cleanup error stops recovery without launching a replacement.
-In particular, macOS can report `PermissionDenied` for a zombie-only group,
-preventing restart even though the leader exited; this remains an explicit
-safety restriction, not a silently ignored error. Incomplete output capture is
+Confirmed zombie-only groups no longer block macOS restart; the regression requires
+all configured replacement generations. Unverified permission failures still block
+recovery. Incomplete output capture is
 reported separately and does not itself prevent restart after clean termination.
 
 This library increment uses deterministic backoff and a strict lifetime budget.
 The specification's proposed jitter, rolling time window and stable-readiness
-budget reset are not implemented. No CLI/config wiring, continuous health checks,
-durable recovery or public forwarding was added. Eight new native restart tests,
+budget reset are not implemented. Continuous health checks and durable recovery
+remain future work. Eight native restart tests,
 all 50 regular tests, formatting and strict Clippy pass locally on macOS and in
 Linux/macOS GitHub Actions for commit `df736b0`. The extended fuzz/soak campaign
 was not rerun for this application-layer increment.
 
 ### Hosting Release
 
-This is a development foundation, not a production hosting release. No TLS,
-HTTP/2, reverse proxy, CLI-managed applications, runtime adapters, config reload,
-WebSockets, FastCGI, compression, range requests or conditional caching yet.
+This is a development foundation, not a production hosting release. No HTTP/2,
+streaming uploads, general packaged runtime adapters, config reload, automatic
+certificate management, FastCGI, compression, range requests or conditional caching yet.
 Windows static serving is unsupported. Linux regression tests have passed;
 bounded Linux and macOS fuzzing and resource-soak campaigns have passed.
 Longer-duration soak tests, exhaustive coverage and performance benchmarks

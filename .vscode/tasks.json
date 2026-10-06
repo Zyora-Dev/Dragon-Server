@@ -15,6 +15,21 @@
 			],
 			"isBackground": true,
 			"problemMatcher": []
+		},
+		{
+			"label": "Dragon: Run Niral demo",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"run",
+				"--locked",
+				"--",
+				"start",
+				"--config",
+				"target/niral-demo/dragon.toml"
+			],
+			"isBackground": true,
+			"problemMatcher": []
 		}
 	]
 }

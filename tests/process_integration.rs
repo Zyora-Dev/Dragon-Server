@@ -29,6 +29,157 @@ fn fixture(mode: &str, directory: &std::path::Path) -> ProcessSpec {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires DRAGON_NIRAL_ROOT and DRAGON_NODE pointing to a local Niral checkout and Node executable"]
+async fn application_niral_production_smoke() {
+    use dragon_server::application::{ApplicationSpec, ReadinessSpec};
+
+    let root = std::fs::canonicalize(std::env::var_os("DRAGON_NIRAL_ROOT").unwrap()).unwrap();
+    let node = std::fs::canonicalize(std::env::var_os("DRAGON_NODE").unwrap()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("routes")).unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"type":"module"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        directory.path().join("routes/index.niral"),
+        r#"<server>
+export function load() { return { message: "Niral SSR under Dragon" }; }
+</server>
+<script>let { message } = $props;</script>
+<h1>{message}</h1>
+"#,
+    )
+    .unwrap();
+    let processes = ProcessManager::new(1).unwrap();
+    let build = processes
+        .spawn(ProcessSpec {
+            executable: node.clone(),
+            args: vec![root.join("bin/niral.js").into(), "build".into(), ".".into()],
+            cwd: directory.path().to_owned(),
+            env: BTreeMap::new(),
+        })
+        .unwrap();
+    let build = timeout(Duration::from_secs(30), build.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let spec = ApplicationSpec {
+        application_id: "test-app".into(),
+        release_id: "local-production-build".into(),
+        process: ProcessSpec {
+            executable: node.clone(),
+            args: vec![
+                "--input-type=module".into(),
+                "--eval".into(),
+                r#"import { pathToFileURL } from 'node:url';
+const { createProdServer } = await import(pathToFileURL(process.env.NIRAL_PROD_MODULE));
+const app = createProdServer({ dist: 'dist', cwd: process.cwd() });
+app.server.listen(Number(process.env.NIRAL_TEST_PORT), '127.0.0.1');
+process.once('SIGTERM', async () => { await app.shutdown(); process.exit(0); });
+"#
+                .into(),
+            ],
+            cwd: directory.path().to_owned(),
+            env: BTreeMap::from([
+                (
+                    "NIRAL_PROD_MODULE".into(),
+                    root.join("src/server/prod.js").into(),
+                ),
+                ("NIRAL_TEST_PORT".into(), address.port().to_string().into()),
+            ]),
+        },
+        readiness: ReadinessSpec {
+            address,
+            path: "/@niral/health".into(),
+            startup_timeout: Duration::from_secs(10),
+            probe_timeout: Duration::from_millis(500),
+            interval: Duration::from_millis(25),
+            max_attempts: 200,
+        },
+    };
+    let mut config = hosted_config(spec);
+    config.limits.response_timeout_ms = 5000;
+    config.sites[0].routes[0].streaming = true;
+    config.sites[0].routes[0].websocket = true;
+    let server = dragon_server::server::Server::new(config).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let public_address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.serve(listener, async {
+        let _ = stopped.await;
+    }));
+    let client = processes
+        .spawn(ProcessSpec {
+            executable: node,
+            args: vec![
+                "--input-type=module".into(),
+                "--eval".into(),
+                r#"
+import assert from 'node:assert/strict';
+const base = process.env.NIRAL_TEST_URL;
+const health = await fetch(base + '/@niral/health');
+assert.equal(health.status, 200);
+assert.ok((await health.json()).release);
+const page = await fetch(base + '/');
+assert.equal(page.status, 200);
+assert.equal(page.headers.get('server'), 'Dragon');
+assert.match(page.headers.get('content-type'), /text\/html/);
+const html = await page.text();
+assert.ok(html.includes('Niral SSR under Dragon'));
+const assets = [...html.matchAll(/(?:src|href)="(\/assets\/[^"?#]+)[^"]*"/g)];
+assert.ok(assets.length > 0, 'production assets present');
+for (const [, asset] of assets) {
+  const response = await fetch(base + asset);
+  assert.equal(response.status, 200, asset);
+  assert.ok((await response.arrayBuffer()).byteLength > 0, asset);
+}
+assert.equal((await fetch(base + '/missing-smoke-route')).status, 404);
+console.log('Niral health, dynamic SSR, production assets and 404 checks passed through Dragon');
+"#
+                .into(),
+            ],
+            cwd: directory.path().to_owned(),
+            env: BTreeMap::from([(
+                "NIRAL_TEST_URL".into(),
+                format!("http://{public_address}").into(),
+            )]),
+        })
+        .unwrap();
+    let client = timeout(Duration::from_secs(15), client.wait()).await;
+    let _ = stop.send(());
+    let cleanup = timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    let client = client.unwrap().unwrap();
+    assert!(
+        client.status.success(),
+        "{}",
+        String::from_utf8_lossy(&client.stderr)
+    );
+    println!("{}", String::from_utf8_lossy(&client.stdout));
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    assert!(
+        tokio::net::TcpStream::connect(public_address)
+            .await
+            .is_err()
+    );
+    assert!(client.group_cleanup_error.is_none());
+    assert!(cleanup.is_ok(), "Niral cleanup failed: {cleanup:?}");
+    println!("Dragon and Niral listeners closed; cleanup: {cleanup:?}");
+}
+
 #[test]
 #[ignore = "native child fixture invoked explicitly by process integration tests"]
 fn child_fixture() {
@@ -68,6 +219,135 @@ fn child_fixture() {
         mode = "http-ready".into();
     }
     match mode.as_str() {
+        "proxy" => {
+            let listener =
+                std::net::TcpListener::bind(std::env::var("DRAGON_FIXTURE_ADDRESS").unwrap())
+                    .unwrap();
+            for socket in listener.incoming() {
+                let mut socket = socket.unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let (target, head_size) = loop {
+                    let mut buffer = [0; 4096];
+                    let count = std::io::Read::read(&mut socket, &mut buffer).unwrap();
+                    if count == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    assert!(request.len() < 131_072);
+                    let mut headers = [httparse::EMPTY_HEADER; 100];
+                    let mut parsed = httparse::Request::new(&mut headers);
+                    if let Ok(httparse::Status::Complete(head_size)) = parsed.parse(&request) {
+                        let length = parsed
+                            .headers
+                            .iter()
+                            .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+                            .map(|header| {
+                                std::str::from_utf8(header.value)
+                                    .unwrap()
+                                    .parse::<usize>()
+                                    .unwrap()
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= head_size + length {
+                            break (parsed.path.unwrap().to_owned(), head_size);
+                        }
+                    }
+                };
+                if target == "/exit" {
+                    return;
+                }
+                if target == "/ws-bad" {
+                    let _ = socket.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: wrong\r\n\r\n");
+                    continue;
+                }
+                if target == "/ws" {
+                    let mut headers = [httparse::EMPTY_HEADER; 100];
+                    let mut parsed = httparse::Request::new(&mut headers);
+                    parsed.parse(&request).unwrap();
+                    let mut handshake = hyper::Request::builder().method("GET").uri("/ws");
+                    for header in parsed.headers {
+                        handshake = handshake.header(header.name, header.value);
+                    }
+                    let handshake = handshake.body(()).unwrap();
+                    let mut response =
+                        tungstenite::handshake::server::create_response(&handshake).unwrap();
+                    if handshake.headers().get("sec-websocket-protocol").is_some() {
+                        response
+                            .headers_mut()
+                            .insert("sec-websocket-protocol", "echo".parse().unwrap());
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 101 Switching Protocols\r\n")
+                        .unwrap();
+                    for (name, value) in response.headers() {
+                        write!(socket, "{}: {}\r\n", name.as_str(), value.to_str().unwrap())
+                            .unwrap();
+                    }
+                    socket.write_all(b"\r\n").unwrap();
+                    let mut websocket = tungstenite::WebSocket::from_partially_read(
+                        socket,
+                        request[head_size..].to_vec(),
+                        tungstenite::protocol::Role::Server,
+                        None,
+                    );
+                    while let Ok(message) = websocket.read() {
+                        if message.is_close() {
+                            let _ = websocket.flush();
+                            break;
+                        }
+                        if message.is_ping() {
+                            let _ = websocket.flush();
+                        } else if websocket.send(message).is_err() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if target == "/stream" || target == "/stream-stall" {
+                    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\nD\r\ndata: first\n\n\r\n");
+                    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                    while !std::path::Path::new("finish-stream").exists()
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    let _ = socket.write_all(b"C\r\ndata: last\n\n\r\n0\r\n\r\n");
+                    continue;
+                }
+                if target == "/slow" {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+                if target == "/oversized" {
+                    let _ =
+                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n");
+                    continue;
+                }
+                if target == "/bad" {
+                    let _ = socket.write_all(b"not HTTP\r\n\r\n");
+                    continue;
+                }
+                if target == "/chunked" {
+                    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close, x-private\r\nX-Private: hidden\r\n\r\n4\r\ntest\r\n0\r\n\r\n");
+                    continue;
+                }
+                let body = if target == "/echo-body" {
+                    &request[head_size..]
+                } else {
+                    &request[..]
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nSet-Cookie: first=1\r\nSet-Cookie: second=2\r\nConnection: close, x-private\r\nX-Private: hidden\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes());
+                if !request.starts_with(b"HEAD ") {
+                    let _ = socket.write_all(body);
+                }
+            }
+        }
         "http-ready" | "http-hang" | "http-oversized" | "http-redirect" | "http-malformed"
         | "http-truncated" => {
             let address = std::env::var("DRAGON_FIXTURE_ADDRESS").unwrap();
@@ -221,6 +501,535 @@ fn application_spec(
     }
 }
 
+fn hosted_config(
+    spec: dragon_server::application::ApplicationSpec,
+) -> dragon_server::config::Config {
+    let mut config: dragon_server::config::Config = toml::from_str(
+        r#"
+schema_version = 1
+[server]
+listen = "127.0.0.1:0"
+[[sites]]
+id = "hosted"
+hosts = ["localhost", "127.0.0.1"]
+[[sites.routes]]
+path = "/"
+match = "prefix"
+methods = ["GET", "HEAD", "POST"]
+action = "proxy"
+application = "test-app"
+"#,
+    )
+    .unwrap();
+    config.limits.response_timeout_ms = 200;
+    config
+        .applications
+        .push(dragon_server::config::Application {
+            id: spec.application_id,
+            release: spec.release_id,
+            executable: spec.process.executable,
+            args: spec
+                .process
+                .args
+                .into_iter()
+                .map(|value| value.into_string().unwrap())
+                .collect(),
+            cwd: spec.process.cwd,
+            env: spec
+                .process
+                .env
+                .into_iter()
+                .map(|(key, value)| (key.into_string().unwrap(), value.into_string().unwrap()))
+                .collect(),
+            address: spec.readiness.address,
+            readiness_path: spec.readiness.path,
+            startup_timeout_ms: 3000,
+            probe_timeout_ms: 100,
+            probe_interval_ms: 10,
+            probe_attempts: 300,
+            restart: dragon_server::config::Restart::Never,
+        });
+    config
+}
+
+async fn proxy_raw(address: std::net::SocketAddr, request: &[u8]) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    timeout(Duration::from_secs(5), async {
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket.write_all(request).await.unwrap();
+        let mut bytes = Vec::new();
+        socket.take(262_144).read_to_end(&mut bytes).await.unwrap();
+        bytes
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn hosted_https_streaming_and_websocket_idle_timeout() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::{TlsConnector, rustls};
+    let directory = tempfile::tempdir().unwrap();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let certificate = directory.path().join("certificate.pem");
+    let private_key = directory.path().join("private-key.pem");
+    std::fs::write(&certificate, certified.cert.pem()).unwrap();
+    std::fs::write(&private_key, certified.key_pair.serialize_pem()).unwrap();
+    let mut config = hosted_config(application_spec("proxy", directory.path()));
+    config.server.tls = Some(dragon_server::config::Tls {
+        certificate,
+        private_key,
+        handshake_timeout_ms: 1000,
+    });
+    config.sites[0].routes[0].streaming = true;
+    config.sites[0].routes[0].websocket = true;
+    config.limits.idle_timeout_ms = 200;
+    let server = dragon_server::server::Server::new(config).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.serve(listener, async {
+        let _ = stopped.await;
+    }));
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certified.cert.der().clone()).unwrap();
+    let connector = TlsConnector::from(Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ));
+    let connect = || async {
+        connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                tokio::net::TcpStream::connect(address).await.unwrap(),
+            )
+            .await
+            .unwrap()
+    };
+    let mut socket = connect().await;
+    socket.write_all(b"GET /echo HTTP/1.1\r\nHost: localhost\r\nOrigin: https://localhost\r\nCookie: session=tls\r\nX-Forwarded-Proto: spoof\r\nConnection: close\r\n\r\n").await.unwrap();
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(2), socket.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    let response = String::from_utf8(response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"));
+    assert!(response.contains("x-forwarded-proto: https"));
+    assert!(
+        response.contains("origin: https://localhost") && response.contains("cookie: session=tls")
+    );
+    assert!(!response.contains("spoof"));
+    let mut socket = connect().await;
+    socket
+        .write_all(b"GET /stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(2), async {
+        while !response
+            .windows(13)
+            .any(|bytes| bytes == b"data: first\n\n")
+        {
+            let mut buffer = [0; 4096];
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert_ne!(count, 0);
+            response.extend_from_slice(&buffer[..count]);
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::write(directory.path().join("finish-stream"), "finish").unwrap();
+    timeout(Duration::from_secs(2), socket.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(response.windows(12).any(|bytes| bytes == b"data: last\n\n"));
+    let (mut websocket, _) = tokio_tungstenite::client_async("wss://localhost/ws", connect().await)
+        .await
+        .unwrap();
+    websocket
+        .send(tungstenite::Message::Text("secure".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        tungstenite::Message::Text("secure".into())
+    );
+    assert!(
+        timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .unwrap()
+            .is_none_or(|result| result.is_err())
+    );
+    stop.send(()).unwrap();
+    let _ = timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn hosted_websocket_echo_admission_early_frames_and_shutdown() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tungstenite::{Message, client::IntoClientRequest, protocol::Role};
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = hosted_config(application_spec("proxy", directory.path()));
+    config.sites[0].routes[0].websocket = true;
+    config.limits.max_in_flight_requests = 1;
+    config.limits.idle_timeout_ms = 1000;
+    let server = dragon_server::server::Server::new(config).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.serve(listener, async {
+        let _ = stopped.await;
+    }));
+    let invalid = proxy_raw(address, b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: invalid\r\nSec-WebSocket-Version: 13\r\n\r\n").await;
+    assert!(invalid.starts_with(b"HTTP/1.1 400"));
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{address}/ws-bad"))
+            .await
+            .is_err()
+    );
+    let mut request = format!("ws://{address}/ws").into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("sec-websocket-protocol", "echo".parse().unwrap());
+    let (mut websocket, response) = tokio_tungstenite::connect_async(request).await.unwrap();
+    assert_eq!(response.headers()["sec-websocket-protocol"], "echo");
+    websocket
+        .send(Message::Binary(vec![0, 255, 128, 42].into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Message::Binary(vec![0, 255, 128, 42].into())
+    );
+    websocket
+        .send(Message::Ping(vec![1, 2].into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Message::Pong(vec![1, 2].into())
+    );
+    let overload = proxy_raw(
+        address,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(overload.starts_with(b"HTTP/1.1 503"));
+    websocket.close(None).await.unwrap();
+    let _ = timeout(Duration::from_secs(2), websocket.next())
+        .await
+        .unwrap();
+    drop(websocket);
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let response = proxy_raw(
+                address,
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            if response.starts_with(b"HTTP/1.1 200") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    socket.write_all(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
+    let mut early =
+        tokio_tungstenite::WebSocketStream::from_raw_socket(&mut socket, Role::Client, None).await;
+    early.send(Message::Text("early".into())).await.unwrap();
+    drop(early);
+    let mut head = Vec::new();
+    timeout(Duration::from_secs(2), async {
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(socket.read_u8().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert!(head.starts_with(b"HTTP/1.1 101"));
+    let mut websocket =
+        tokio_tungstenite::WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
+    assert_eq!(
+        timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Message::Text("early".into())
+    );
+    stop.send(()).unwrap();
+    let _ = timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(2), websocket.next())
+            .await
+            .unwrap()
+            .is_none_or(|message| message.is_err())
+    );
+}
+
+#[tokio::test]
+async fn hosted_streaming_delivers_before_eof_and_closes_idle_streams() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for stalled in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = hosted_config(application_spec("proxy", directory.path()));
+        config.sites[0].routes[0].streaming = true;
+        config.limits.max_proxy_response_bytes = 1;
+        config.limits.max_in_flight_requests = 1;
+        config.limits.response_timeout_ms = 500;
+        let server = dragon_server::server::Server::new(config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.serve(listener, async {
+            let _ = stopped.await;
+        }));
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(b"GET /stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(2), async {
+            while !received
+                .windows(13)
+                .any(|bytes| bytes == b"data: first\n\n")
+            {
+                let mut buffer = [0; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0, "stream closed before its first event");
+                received.extend_from_slice(&buffer[..count]);
+            }
+        })
+        .await
+        .unwrap();
+        let overload = proxy_raw(
+            address,
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(overload.starts_with(b"HTTP/1.1 503"));
+        if !stalled {
+            std::fs::write(directory.path().join("finish-stream"), "finish").unwrap();
+        }
+        timeout(Duration::from_secs(2), socket.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            received.windows(12).any(|bytes| bytes == b"data: last\n\n"),
+            !stalled
+        );
+        assert_eq!(received.ends_with(b"0\r\n\r\n"), !stalled);
+        stop.send(()).unwrap();
+        let _ = timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn hosted_proxy_preserves_requests_and_bounds_upstream_failures() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = hosted_config(application_spec("proxy", directory.path()));
+    let upstream = config.applications[0].address;
+    let server = dragon_server::server::Server::new(config).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.serve(listener, async {
+        let _ = stopped.await;
+    }));
+    let bytes = proxy_raw(address, b"POST /echo?value=one%20two HTTP/1.1\r\nHost: localhost:9999\r\nOrigin: http://localhost:9999\r\nCookie: session=test\r\nX-Forwarded-For: spoof\r\nForwarded: spoof\r\nX-Real-IP: spoof\r\nX-Private: hidden\r\nConnection: close, x-private\r\nContent-Length: 7\r\n\r\npayload").await;
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    assert!(body.starts_with("POST /echo?value=one%20two HTTP/1.1"));
+    assert!(body.ends_with("payload"));
+    assert!(body.contains("host: localhost:9999"));
+    assert!(body.contains("origin: http://localhost:9999"));
+    assert!(body.contains("cookie: session=test"));
+    assert!(body.contains("x-forwarded-proto: http"));
+    assert!(!text.contains("spoof") && !text.contains("hidden"));
+    assert!(head.contains("set-cookie: first=1") && head.contains("set-cookie: second=2"));
+    assert!(head.contains("server: Dragon"));
+    let bytes = proxy_raw(address, b"POST /echo-body HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n\x00\xffab\r\n0\r\nX-Trailer: ignored\r\n\r\n").await;
+    assert!(bytes.starts_with(b"HTTP/1.1 200"));
+    assert!(bytes.ends_with(b"\x00\xffab"));
+    let head = proxy_raw(
+        address,
+        b"HEAD /echo HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(head.starts_with(b"HTTP/1.1 200") && head.ends_with(b"\r\n\r\n"));
+    for (path, expected) in [
+        ("/chunked", 200),
+        ("/oversized", 502),
+        ("/bad", 502),
+        ("/slow", 504),
+    ] {
+        let bytes = proxy_raw(
+            address,
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await;
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.starts_with(&format!("HTTP/1.1 {expected}")),
+            "{path}: {text}"
+        );
+        if path == "/chunked" {
+            assert!(
+                text.ends_with("test")
+                    && !text.contains("transfer-encoding")
+                    && !text.contains("hidden")
+            );
+        }
+    }
+    let upgrade = proxy_raw(address, b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close, upgrade\r\nUpgrade: websocket\r\n\r\n").await;
+    assert!(upgrade.starts_with(b"HTTP/1.1 501"));
+    stop.send(()).unwrap();
+    let cleanup = timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(cleanup.is_ok(), "proxy cleanup failed: {cleanup:?}");
+    assert!(tokio::net::TcpStream::connect(upstream).await.is_err());
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test]
+async fn hosted_proxy_withholds_traffic_after_application_exit() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = dragon_server::server::Server::new(hosted_config(application_spec(
+        "proxy",
+        directory.path(),
+    )))
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.serve(listener, async {
+        let _ = stopped.await;
+    }));
+    let failed = proxy_raw(
+        address,
+        b"GET /exit HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(failed.starts_with(b"HTTP/1.1 502"));
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let bytes = proxy_raw(
+                address,
+                b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            if bytes.starts_with(b"HTTP/1.1 503") {
+                break;
+            }
+            assert!(bytes.starts_with(b"HTTP/1.1 502"));
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(()).unwrap();
+    let _ = timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn hosted_startup_failure_and_cancellation_clean_up() {
+    for cancel in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = hosted_config(application_spec("http-ready", directory.path()));
+        config.applications[0].startup_timeout_ms = 200;
+        let upstream = config.applications[0].address;
+        let server = dragon_server::server::Server::new(config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.serve(listener, async {
+            let _ = stopped.await;
+        }));
+        started(directory.path()).await;
+        if cancel {
+            let _ = stop.send(());
+        }
+        let outcome = timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        if !cancel {
+            assert!(outcome.is_err());
+        }
+        assert!(tokio::net::TcpStream::connect(upstream).await.is_err());
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
+}
+
+#[test]
+fn hosted_configuration_rejects_invalid_launch_and_proxy_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    for case in 0..9 {
+        let mut config = hosted_config(application_spec("proxy", directory.path()));
+        match case {
+            0 => config.applications[0].address = "192.0.2.1:8199".parse().unwrap(),
+            1 => config.applications[0].probe_attempts = 0,
+            2 => config.applications[0]
+                .env
+                .insert("bad=key".into(), "value".into())
+                .map(|_| ())
+                .unwrap_or(()),
+            3 => config.sites[0].routes[0].application = Some("missing".into()),
+            4 => config.sites[0].routes[0].body = Some("not permitted".into()),
+            5 => config.applications[0].readiness_path = "//invalid".into(),
+            6 => config.applications[0].args.push("bad\0argument".into()),
+            7 => {
+                config.applications[0].restart = dragon_server::config::Restart::Always {
+                    max_restarts: 0,
+                    initial_delay_ms: 1,
+                    max_delay_ms: 1,
+                }
+            }
+            _ => config.applications[0].executable = directory.path().join("missing"),
+        }
+        assert!(config.validate(directory.path()).is_err(), "case {case}");
+    }
+}
+
 #[tokio::test]
 async fn application_readiness_is_distinct_from_process_existence() {
     use dragon_server::application::{ApplicationManager, InstanceState};
@@ -250,14 +1059,8 @@ async fn application_readiness_is_distinct_from_process_existence() {
         .unwrap();
     assert_eq!(output.identity, identity);
     assert!(output.failure.is_none());
-    assert_eq!(
-        *states.borrow(),
-        if output.process.group_cleanup_error.is_some() {
-            InstanceState::Failed
-        } else {
-            InstanceState::Stopped
-        }
-    );
+    assert!(output.process.group_cleanup_error.is_none());
+    assert_eq!(*states.borrow(), InstanceState::Stopped);
     assert!(tokio::net::TcpStream::connect(address).await.is_err());
     let next = manager
         .start(application_spec("hold", directory.path()))
@@ -575,7 +1378,7 @@ async fn application_restart_readiness_failures_consume_budget() {
 }
 
 #[tokio::test]
-async fn application_restart_stops_on_reported_cleanup_error() {
+async fn application_restart_reaps_exited_leaders_before_replacement() {
     use dragon_server::application::{
         ApplicationManager, InstanceFailure, InstanceState, RestartPolicy,
     };
@@ -592,13 +1395,9 @@ async fn application_restart_stops_on_reported_cleanup_error() {
         .await
         .unwrap()
         .unwrap();
-    if output.process.group_cleanup_error.is_some() {
-        assert_eq!(output.failure, Some(InstanceFailure::ProcessExited));
-        assert!(output.identity.process_generation <= 3);
-    } else {
-        assert_eq!(output.failure, Some(InstanceFailure::RestartLimit));
-        assert_eq!(output.identity.process_generation, 3);
-    }
+    assert!(output.process.group_cleanup_error.is_none());
+    assert_eq!(output.failure, Some(InstanceFailure::RestartLimit));
+    assert_eq!(output.identity.process_generation, 3);
     assert_eq!(*states.borrow(), InstanceState::Failed);
     application_capacity_recovers(&manager, directory.path()).await;
 }
@@ -820,6 +1619,7 @@ async fn process_captures_bounded_output_and_preserves_exit_status() {
         .unwrap()
         .unwrap();
     assert_eq!(output.status.code(), Some(7));
+    assert!(output.group_cleanup_error.is_none());
     assert_eq!(output.stdout, vec![b'o'; 32_768]);
     assert_eq!(output.stderr, vec![b'e'; 32_768]);
     assert!(output.stdout_truncated && output.stderr_truncated && output.output_complete);
@@ -948,6 +1748,11 @@ async fn process_graceful_shutdown_preserves_application_exit() {
         .unwrap();
     assert!(output.status.success());
     assert!(!output.shutdown_escalated);
+    assert!(
+        output.group_cleanup_error.is_none(),
+        "graceful cleanup failed: {:?}",
+        output.group_cleanup_error
+    );
     assert!(output.output_complete);
     assert_eq!(
         std::fs::read(directory.path().join("graceful-stop")).unwrap(),

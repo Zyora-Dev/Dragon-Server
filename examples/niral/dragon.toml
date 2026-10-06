@@ -1,0 +1,33 @@
+schema_version = 1
+
+[server]
+listen = "127.0.0.1:8081"
+shutdown_timeout_ms = 10000
+
+[[applications]]
+id = "niral-site"
+release = "local-production-build"
+executable = "/absolute/path/to/node"
+args = ["/absolute/path/to/dragon/examples/niral/start.mjs"]
+cwd = "/absolute/path/to/built-niral-site"
+env = { NIRAL_ROOT = "/absolute/path/to/niral", NIRAL_PORT = "8199" }
+address = "127.0.0.1:8199"
+readiness_path = "/@niral/health"
+startup_timeout_ms = 10000
+probe_timeout_ms = 500
+probe_interval_ms = 25
+probe_attempts = 200
+restart = { mode = "never" }
+
+[[sites]]
+id = "niral"
+hosts = ["localhost", "127.0.0.1"]
+
+[[sites.routes]]
+path = "/"
+match = "prefix"
+methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+action = "proxy"
+application = "niral-site"
+streaming = true
+websocket = true

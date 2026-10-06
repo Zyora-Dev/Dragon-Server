@@ -4,6 +4,7 @@ use std::io;
 
 enum Stage {
     Head,
+    Upgrade,
     Fixed(u64),
     ChunkSize,
     ChunkData(u64),
@@ -31,11 +32,20 @@ impl Ingress {
     pub(crate) fn append(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
     }
+    pub(crate) fn deliver_upgraded(&mut self, destination: &mut tokio::io::ReadBuf<'_>) -> bool {
+        let count = self.bytes.len().min(destination.remaining());
+        destination.put_slice(&self.bytes[..count]);
+        self.bytes.advance(count);
+        count != 0
+    }
     pub(crate) fn capacity(&self) -> usize {
         self.limits
             .max_header_bytes
             .saturating_sub(self.bytes.len())
             .min(16_384)
+    }
+    pub(crate) fn awaiting_upgrade(&self) -> bool {
+        self.approved == 0 && matches!(self.stage, Stage::Upgrade)
     }
 
     pub(crate) fn deliver(&mut self, destination: &mut tokio::io::ReadBuf<'_>) -> io::Result<bool> {
@@ -60,6 +70,7 @@ impl Ingress {
             )
         };
         match self.stage {
+            Stage::Upgrade => Ok(None),
             Stage::Head => {
                 let mut headers = vec![httparse::EMPTY_HEADER; self.limits.max_headers];
                 let mut request = httparse::Request::new(&mut headers);
@@ -75,7 +86,9 @@ impl Ingress {
                 }
                 let mut content_length = None;
                 let mut chunked = false;
+                let mut upgrade = false;
                 for header in request.headers {
+                    upgrade |= header.name.eq_ignore_ascii_case("upgrade");
                     if header.name.eq_ignore_ascii_case("content-length") {
                         let value = std::str::from_utf8(header.value).map_err(|_| bad())?;
                         if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -101,6 +114,8 @@ impl Ingress {
                     Stage::ChunkSize
                 } else if let Some(size @ 1..) = content_length {
                     Stage::Fixed(size)
+                } else if upgrade {
+                    Stage::Upgrade
                 } else {
                     Stage::Head
                 };
@@ -203,6 +218,33 @@ mod tests {
             }
         }
         Ok(output)
+    }
+
+    #[test]
+    fn upgrade_boundary_preserves_opaque_bytes_at_every_split() {
+        let head = b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let input = [head.as_slice(), b"\x81\x82\x01\x02\x03\x04\xfe\xff"].concat();
+        for split in 0..=input.len() {
+            let mut guard = Ingress::new(Limits::default());
+            let mut delivered = Vec::new();
+            for fragment in [&input[..split], &input[split..]] {
+                guard.append(fragment);
+                loop {
+                    let mut bytes = [0; 7];
+                    let mut output = ReadBuf::new(&mut bytes);
+                    if !guard.deliver(&mut output).unwrap() {
+                        break;
+                    }
+                    delivered.extend_from_slice(output.filled());
+                }
+            }
+            assert!(guard.awaiting_upgrade());
+            assert_eq!(delivered, head);
+            let mut bytes = [0; 128];
+            let mut output = ReadBuf::new(&mut bytes);
+            assert!(guard.deliver_upgraded(&mut output));
+            assert_eq!(output.filled(), &input[head.len()..]);
+        }
     }
 
     #[test]

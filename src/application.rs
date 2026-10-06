@@ -72,7 +72,7 @@ impl RestartPolicy {
         }
     }
 
-    fn validate(self) -> io::Result<()> {
+    pub(crate) fn validate(self) -> io::Result<()> {
         if let Some(budget) = self.budget()
             && (!(1..=1000).contains(&budget.max_restarts)
                 || budget.initial_delay < Duration::from_millis(1)
@@ -131,7 +131,7 @@ struct Lifecycle {
 }
 
 impl ReadinessSpec {
-    fn validate(&self) -> io::Result<()> {
+    pub(crate) fn validate(&self) -> io::Result<()> {
         let valid_duration = |value: Duration| {
             (Duration::from_millis(1)..=Duration::from_secs(300)).contains(&value)
         };

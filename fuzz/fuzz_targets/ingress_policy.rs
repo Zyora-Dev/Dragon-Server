@@ -18,7 +18,7 @@ fuzz_target!(|data: &[u8]| {
         let mut position = 0;
         let mut delivered = 0;
         let mut failed = false;
-        while position < data.len() && !failed {
+        while position < data.len() && !failed && !guard.awaiting_upgrade() {
             let count = fragment_size
                 .min(guard.capacity())
                 .min(data.len() - position);

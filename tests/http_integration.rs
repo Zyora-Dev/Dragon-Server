@@ -97,6 +97,126 @@ fn status(bytes: &[u8]) -> u16 {
         .unwrap()
 }
 
+#[tokio::test]
+async fn https_verifies_certificates_rejects_plaintext_and_bounds_handshakes() {
+    use std::sync::Arc;
+    use tokio_rustls::{TlsConnector, rustls};
+    let directory = tempfile::tempdir().unwrap();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let certificate = directory.path().join("certificate.pem");
+    let private_key = directory.path().join("private-key.pem");
+    std::fs::write(&certificate, certified.cert.pem()).unwrap();
+    std::fs::write(&private_key, certified.key_pair.serialize_pem()).unwrap();
+    let harness = Harness::start(|config| {
+        config.server.tls = Some(dragon_server::config::Tls {
+            certificate,
+            private_key,
+            handshake_timeout_ms: 100,
+        });
+        config.limits.max_connections = 1;
+    })
+    .await;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certified.cert.der().clone()).unwrap();
+    let mut client = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let connector = TlsConnector::from(Arc::new(client));
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let mut stalled = TcpStream::connect(harness.address).await.unwrap();
+    let mut buffer = [0; 1];
+    assert_eq!(
+        timeout(Duration::from_secs(2), stalled.read(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    drop(stalled);
+    let mut socket = connector
+        .connect(
+            name.clone(),
+            TcpStream::connect(harness.address).await.unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        socket.get_ref().1.alpn_protocol(),
+        Some(b"http/1.1".as_slice())
+    );
+    socket
+        .write_all(b"GET /hello HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(2), socket.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status(&response), 200);
+    assert!(response.windows(14).any(|bytes| bytes == b"server: Dragon"));
+    let plaintext = harness.get("GET", "/hello").await;
+    assert!(!plaintext.starts_with(b"HTTP/1.1 200"));
+    let untrusted = TlsConnector::from(Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth(),
+    ));
+    assert!(
+        untrusted
+            .connect(name, TcpStream::connect(harness.address).await.unwrap())
+            .await
+            .is_err()
+    );
+    harness.finish().await;
+}
+
+#[test]
+fn https_rejects_invalid_certificates_keys_and_configuration() {
+    let directory = tempfile::tempdir().unwrap();
+    let example = std::env::current_dir()
+        .unwrap()
+        .join("examples/minimal/dragon.toml");
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let different = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let certificate = directory.path().join("certificate.pem");
+    let private_key = directory.path().join("private-key.pem");
+    for case in 0..6 {
+        std::fs::write(&certificate, certified.cert.pem()).unwrap();
+        std::fs::write(&private_key, certified.key_pair.serialize_pem()).unwrap();
+        let mut config = Config::load(&example).unwrap();
+        config.server.tls = Some(dragon_server::config::Tls {
+            certificate: certificate.clone(),
+            private_key: private_key.clone(),
+            handshake_timeout_ms: if case == 0 { 0 } else { 1000 },
+        });
+        match case {
+            1 => std::fs::write(&certificate, "not a certificate").unwrap(),
+            2 => std::fs::write(&private_key, "not a key").unwrap(),
+            3 => std::fs::write(&private_key, different.key_pair.serialize_pem()).unwrap(),
+            4 => std::fs::write(&certificate, vec![b'x'; 1_048_577]).unwrap(),
+            5 => config.server.tls.as_mut().unwrap().certificate = directory.path().to_owned(),
+            _ => {}
+        }
+        assert!(Server::new(config).is_err(), "case {case}");
+    }
+    std::fs::write(&certificate, certified.cert.pem()).unwrap();
+    std::fs::write(&private_key, certified.key_pair.serialize_pem()).unwrap();
+    let mut config = Config::load(&example).unwrap();
+    config.server.tls = Some(dragon_server::config::Tls {
+        certificate: "certificate.pem".into(),
+        private_key: "private-key.pem".into(),
+        handshake_timeout_ms: 1000,
+    });
+    config.validate(directory.path()).unwrap();
+    assert_eq!(
+        config.server.tls.as_ref().unwrap().certificate,
+        certificate.canonicalize().unwrap()
+    );
+    assert!(Server::new(config).is_ok());
+}
+
 fn body(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .windows(4)

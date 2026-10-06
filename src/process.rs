@@ -68,10 +68,86 @@ struct OwnedProcess {
     armed: bool,
 }
 
+#[cfg(target_os = "macos")]
+fn zombie_only_group(group: Pid) -> bool {
+    const PROC_PGRP_ONLY: u32 = 2;
+    let members = || {
+        let mut processes = vec![0i32; 4096];
+        let capacity = std::mem::size_of_val(processes.as_slice());
+        let written = unsafe {
+            libc::proc_listpids(
+                PROC_PGRP_ONLY,
+                group.as_raw_pid() as u32,
+                processes.as_mut_ptr().cast(),
+                capacity as i32,
+            )
+        };
+        if written <= 0
+            || written as usize >= capacity
+            || written as usize % std::mem::size_of::<i32>() != 0
+        {
+            return None;
+        }
+        processes.truncate(written as usize / std::mem::size_of::<i32>());
+        processes.sort_unstable();
+        if !processes.contains(&group.as_raw_pid()) || processes.iter().any(|pid| *pid <= 0) {
+            return None;
+        }
+        Some(processes)
+    };
+    let Some(before) = members() else {
+        return false;
+    };
+    for pid in &before {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        let written = unsafe {
+            libc::proc_pidinfo(
+                *pid,
+                libc::PROC_PIDTBSDINFO,
+                1,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written != size {
+            return false;
+        }
+        let info = unsafe { info.assume_init() };
+        if info.pbi_pid != *pid as u32
+            || info.pbi_pgid != group.as_raw_pid() as u32
+            || info.pbi_status != libc::SZOMB
+        {
+            return false;
+        }
+    }
+    members().as_ref() == Some(&before)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn zombie_inspection_rejects_live_and_missing_groups() {
+    use std::os::unix::process::CommandExt;
+
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let group = Pid::from_raw(child.id() as i32).unwrap();
+    let live = zombie_only_group(group);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(!live);
+    assert!(!zombie_only_group(group));
+}
+
 impl OwnedProcess {
     fn signal(&self, signal: Signal) -> io::Result<()> {
         match kill_process_group(self.group, signal) {
             Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+            #[cfg(target_os = "macos")]
+            Err(rustix::io::Errno::PERM) if self.armed && zombie_only_group(self.group) => Ok(()),
             Err(error) => Err(io::Error::new(
                 error.kind(),
                 format!("signal process group with {signal:?}: {error}"),
