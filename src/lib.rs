@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod application;
 pub mod config;
 mod ingress;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

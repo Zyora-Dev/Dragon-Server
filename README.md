@@ -187,13 +187,108 @@ Dragon cannot signal. It is not silently treated as successful group cleanup.
 This primitive is for trusted, non-daemonizing workloads only. Process groups
 are not containment: descendants can escape into other groups or sessions.
 Dragon reaps its direct child, not arbitrary grandchildren. There is no traffic
-drain, readiness, restart policy, service identity or runtime adapter yet. The
+drain, OS service identity or runtime adapter yet. Startup readiness, logical
+instance identity and restart policy belong to the application layer below. The
 grace period bounds time before escalation, not the OS's total termination time.
 The process API is currently compiled only for Linux and macOS; these lifecycle
 tests have passed on both platforms in GitHub Actions. Output
 draining has a one-second deadline per stream after child exit and reports
 `output_complete = false` if it times out or fails. It is not a full supervisor,
 hostile-code sandbox or crash-recovery mechanism.
+
+### Application Identity And Readiness
+
+The Linux/macOS library exposes `application::ApplicationManager`,
+`ApplicationSpec`, `ReadinessSpec` and `ApplicationHandle`. This layer owns a
+bounded process manager; it is not wired to the CLI, TOML schema or public routing.
+`start` validates the full application/readiness specification before spawning.
+Application and release IDs accept 1-128 ASCII letters, digits, dots, hyphens and
+underscores. Each application start receives a distinct process-local numeric
+instance ID and process generation 1. Automatic restarts retain the instance ID
+and increment the generation after each successful replacement launch.
+`identity()` retains the initial identity; `current_identity()` returns a current
+generation snapshot, and completion carries the final launched generation.
+IDs are not PIDs, authorization credentials or durable recovery identities.
+
+Handles expose `identity()`, `state()` and `subscribe()` for watch snapshots:
+`Starting -> Running -> Ready`, then `Stopping -> Stopped` for an explicit stop.
+Without a restart policy, startup failure or unexpected exit, including exit
+code zero, yields `Failed`.
+Snapshots may skip intermediate transitions; they are not an audit event stream.
+Exit notification removes readiness before waiting for output capture to finish.
+Cleanup errors also leave the state `Failed`; inspect `ApplicationOutput.process`,
+including `group_cleanup_error`, even when the lifecycle `failure` is `None`.
+
+Readiness sends HTTP/1.1 HEAD to an explicitly configured loopback IP and nonzero
+port, with the socket address as Host. A complete status-200 response head passes;
+redirects, other statuses, malformed/truncated or oversized headers do not.
+Responses are capped at 8 KiB and 64 headers. No DNS, redirects, TLS or response
+body processing is performed. The origin-form path is capped at 2,048 bytes.
+The caller sets an overall startup deadline, per-attempt timeout, retry interval
+(each 1 ms through 300 seconds), and attempt cap (1 through 1,000). Probe timeout
+cannot exceed startup timeout. Failed attempts retry within both budgets.
+
+`wait_ready(&mut self)` waits for startup readiness without transferring ownership;
+cancelling that borrowed wait does not stop the instance. `stop()` interrupts
+startup probing and waits for process cleanup. Dropping the handle or cancelling
+its consuming `wait()` requests the same background cleanup. Keep Tokio alive
+until cleanup completes. The startup deadline bounds probing, not subsequent OS
+termination or output-drain time. Completion retains process output and typed
+startup/exit failure reasons.
+
+This is a startup-only check, not continuous readiness or liveness monitoring.
+A previously ready instance is marked failed when its process exits, but a hung
+live process is not detected after startup. Endpoint ownership is a trusted
+operator contract: the caller must provide a private endpoint belonging to this
+instance. Dragon does not yet reserve that port, authenticate probe responses,
+or verify socket ownership; an unrelated local service could satisfy the probe.
+This API does not make an instance eligible for public traffic. Application
+revision/operation serialization, durable identity and adapters
+remain future work. The new readiness tests are currently verified locally on
+macOS; previous Linux CI evidence predates this layer.
+
+### Bounded Restarts
+
+`start(spec)` continues to use `RestartPolicy::Never`. Opt in with
+`start_with_restart(spec, RestartPolicy::OnFailure(budget))` or
+`RestartPolicy::Always(budget)`, where `RestartBudget` supplies `max_restarts`,
+`initial_delay` and `max_delay`. Budgets permit 1-1,000 replacement launches;
+delays must be at least 1 ms, with initial delay no greater than maximum delay
+and maximum delay no greater than 300 seconds. Invalid policies never spawn.
+
+`OnFailure` retries readiness failure and unsuccessful process exit; successful
+exit completes as `Stopped`, suitable for one-shot jobs. `Always` also retries
+successful exits and should only be used for long-running services. Explicit
+stop, handle drop and cancellation of the consuming wait never request a restart.
+Cancelling the borrowed readiness wait still leaves supervision active.
+
+The supervisor removes readiness, enters `Restarting`, and awaits process-group
+cleanup, direct-child reaping and bounded output draining before `Backoff`.
+The first delay is `initial_delay`; subsequent delays double up to `max_delay`.
+The application retains its admission slot through cleanup and backoff. Stop
+interrupts backoff, and every replacement must pass a fresh startup readiness
+check. `wait_ready()` can wait across recovery states. It is still a snapshot,
+not a guarantee that a ready process will remain healthy.
+
+The budget is a lifetime limit per application handle, excluding the initial
+launch. It does not reset after readiness or elapsed time. Exhaustion yields
+`Failed` with `InstanceFailure::RestartLimit`; there is no automatic recovery
+from this terminal state. A replacement spawn error is terminal and reported as
+`RestartSpawnFailed` plus `ApplicationOutput.restart_error`. Output retains only
+the last launched process's status and bounded output, not generation history.
+
+Any process cleanup error stops recovery without launching a replacement.
+In particular, macOS can report `PermissionDenied` for a zombie-only group,
+preventing restart even though the leader exited; this remains an explicit
+safety restriction, not a silently ignored error. Incomplete output capture is
+reported separately and does not itself prevent restart after clean termination.
+
+This library increment uses deterministic backoff and a strict lifetime budget.
+The specification's proposed jitter, rolling time window and stable-readiness
+budget reset are not implemented. No CLI/config wiring, continuous health checks,
+durable recovery or public forwarding was added. Eight new native restart tests,
+all 50 regular tests, formatting and strict Clippy pass locally on macOS; Linux
+validation for the application layer remains pending.
 
 ### Hosting Release
 

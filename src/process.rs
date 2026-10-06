@@ -13,13 +13,14 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, Command},
     signal::unix::{Signal as ChildSignal, SignalKind, signal},
-    sync::{Semaphore, oneshot},
+    sync::{Semaphore, oneshot, watch},
     task::JoinHandle,
     time::timeout,
 };
 
 const OUTPUT_LIMIT: usize = 32_768;
 
+#[derive(Clone)]
 pub struct ProcessSpec {
     pub executable: PathBuf,
     pub args: Vec<OsString>,
@@ -35,6 +36,7 @@ pub struct ProcessManager {
 pub struct ProcessHandle {
     stop: Option<oneshot::Sender<()>>,
     completion: JoinHandle<io::Result<ProcessOutput>>,
+    exited: watch::Receiver<bool>,
 }
 
 pub struct ProcessOutput {
@@ -272,11 +274,13 @@ impl ProcessManager {
         let mut stdout = Capture::start(owned.child.stdout.take().expect("piped stdout"));
         let mut stderr = Capture::start(owned.child.stderr.take().expect("piped stderr"));
         let (stop, stopped) = oneshot::channel();
+        let (exit_notice, exited) = watch::channel(false);
         let grace = self.shutdown_timeout;
         let completion = tokio::spawn(async move {
             let _permit = permit;
-            let (status, shutdown_escalated, group_cleanup_error) =
-                owned.supervise(stopped, grace).await?;
+            let result = owned.supervise(stopped, grace).await;
+            exit_notice.send_replace(true);
+            let (status, shutdown_escalated, group_cleanup_error) = result?;
             let (
                 (stdout, stdout_truncated, stdout_complete),
                 (stderr, stderr_truncated, stderr_complete),
@@ -295,11 +299,20 @@ impl ProcessManager {
         Ok(ProcessHandle {
             stop: Some(stop),
             completion,
+            exited,
         })
     }
 }
 
 impl ProcessHandle {
+    pub(crate) async fn exited(&mut self) {
+        while !*self.exited.borrow_and_update() {
+            if self.exited.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     pub async fn wait(mut self) -> io::Result<ProcessOutput> {
         (&mut self.completion).await.map_err(io::Error::other)?
     }
