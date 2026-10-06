@@ -218,8 +218,12 @@ echo, shutdown, trusted/untrusted TLS, handshake timeout, secure streaming, WSS
 and macOS live/missing-group rejection during zombie inspection.
 The opt-in real Niral smoke also passes with streaming enabled. A short macOS ASan
 run replayed 3,407 corpus inputs without failure; it is not an extended protocol
-fuzz campaign. New Linux CI and extended fuzz/soak have not been run. Normal runs
-also ignore the Niral test.
+fuzz campaign. The current implementation at `8ae5188` passed formatting, strict
+all-target Clippy and all 60 Linux / 61 macOS regular tests with Rust 1.89.0 in
+[run 37517562790](https://github.com/Zyora-Dev/Dragon-Server/actions/runs/37517562790).
+Ubuntu 24.04 completed in 54 seconds; macOS completed in 1 minute 28 seconds.
+Extended fuzz/soak was not rerun. Normal runs also ignore the Niral test; its
+real-application smoke result above remains macOS-only.
 
 ### Optional Niral Smoke Test
 
