@@ -3,6 +3,50 @@ on: workflow_dispatch
 permissions:
   contents: read
 jobs:
+  linux-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check out pinned Niral runtime
+        uses: actions/checkout@v4
+        with:
+          repository: Zyora-Dev/niral
+          ref: 3bf4d1c46b63b4758e14ce4df3386d8a4c6fc0a4
+          path: target/compat-niral
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install Rust
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: Lifecycle and protocol compatibility
+        run: |
+          set -o pipefail
+          cargo +1.89.0 test --locked --test process_integration -- --nocapture 2>&1 | tee compatibility.log
+      - name: Real Niral production compatibility
+        run: |
+          set -o pipefail
+          export DRAGON_NIRAL_ROOT="$GITHUB_WORKSPACE/target/compat-niral"
+          DRAGON_NODE="$(command -v node)"
+          export DRAGON_NODE
+          node --version | tee niral.log
+          cargo +1.89.0 test --locked --test process_integration application_niral_production_smoke -- --ignored --exact --nocapture 2>&1 | tee -a niral.log
+      - name: Retain compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-compatibility-node-${{ matrix.node }}
+          path: |
+            compatibility.log
+            niral.log
+          retention-days: 14
   linux-validation:
     runs-on: ubuntu-latest
     timeout-minutes: 30
