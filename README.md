@@ -323,7 +323,13 @@ compatibility and sustained child-process resource checks remain unverified.
 The TLS/WebSocket soak passed a 60-second macOS run on 2026-10-07: 2,280 measured
 connection attempts plus two persistent secure sockets; descriptors baseline/peak
 19, after shutdown 10; RSS baseline/peak/after 15,296/15,744/15,488 KiB. All 61
-regular tests and strict Clippy passed. The ten-minute Linux protocol run is pending.
+regular tests and strict Clippy passed. At `5b1cb79`, the 600-second Linux
+[protocol run 37564085893](https://github.com/Zyora-Dev/Dragon-Server/actions/runs/37564085893)
+passed 16,576 measured connection attempts plus two persistent secure sockets:
+descriptors baseline/peak/after 22/22/12, RSS KiB 17,360/18,068/17,324. Active
+tunnels and both listeners closed with successful managed-process cleanup.
+[Regular CI 37564084548](https://github.com/Zyora-Dev/Dragon-Server/actions/runs/37564084548)
+also passed formatting, strict Clippy and all 60 Linux / 61 macOS regular tests.
 
 For the earlier HTTP foundation on macOS, the five-minute ASan campaign completed 3,555,327 executions without a
 crash or invariant failure. The ten-minute soak passed 61,408 connections:
