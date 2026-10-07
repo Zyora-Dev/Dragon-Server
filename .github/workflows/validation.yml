@@ -1,9 +1,41 @@
 name: Extended validation
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Validation campaign
+        type: choice
+        default: all
+        options:
+          - all
+          - protocols
 permissions:
   contents: read
 jobs:
+  linux-protocol-soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: Sustained TLS and WebSocket resource budgets
+        env:
+          DRAGON_SOAK_SECONDS: '600'
+        run: |
+          set -o pipefail
+          cargo +1.89.0 test --locked --test process_integration sustained_tls_websocket_has_bounded_resources -- --ignored --exact --nocapture 2>&1 | tee protocol-soak.log
+      - name: Retain protocol evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-protocol-soak-evidence
+          path: protocol-soak.log
+          retention-days: 14
   linux-compatibility:
+    if: ${{ inputs.scope != 'protocols' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -48,6 +80,7 @@ jobs:
             niral.log
           retention-days: 14
   linux-validation:
+    if: ${{ inputs.scope != 'protocols' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

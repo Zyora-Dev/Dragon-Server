@@ -5,6 +5,8 @@ use std::{collections::BTreeMap, io::Write, time::Duration};
 use dragon_server::process::{ProcessManager, ProcessSpec};
 use tokio::time::{Instant, timeout};
 
+mod support;
+
 fn fixture(mode: &str, directory: &std::path::Path) -> ProcessSpec {
     ProcessSpec {
         executable: std::env::current_exe().unwrap(),
@@ -293,17 +295,19 @@ fn child_fixture() {
                         tungstenite::protocol::Role::Server,
                         None,
                     );
-                    while let Ok(message) = websocket.read() {
-                        if message.is_close() {
-                            let _ = websocket.flush();
-                            break;
+                    std::thread::spawn(move || {
+                        while let Ok(message) = websocket.read() {
+                            if message.is_close() {
+                                let _ = websocket.flush();
+                                break;
+                            }
+                            if message.is_ping() {
+                                let _ = websocket.flush();
+                            } else if websocket.send(message).is_err() {
+                                break;
+                            }
                         }
-                        if message.is_ping() {
-                            let _ = websocket.flush();
-                        } else if websocket.send(message).is_err() {
-                            break;
-                        }
-                    }
+                    });
                     continue;
                 }
                 if target == "/stream" || target == "/stream-stall" {
@@ -563,6 +567,255 @@ async fn proxy_raw(address: std::net::SocketAddr, request: &[u8]) -> Vec<u8> {
     })
     .await
     .unwrap()
+}
+
+async fn soak_tls_connect(
+    address: std::net::SocketAddr,
+    connector: &tokio_rustls::TlsConnector,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    connector
+        .connect(
+            tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            tokio::net::TcpStream::connect(address).await.unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn soak_websocket_exchange(
+    websocket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    use futures_util::{SinkExt, StreamExt};
+    use tungstenite::Message;
+    for message in [
+        Message::Text("secure soak".into()),
+        Message::Binary(vec![0x5a; 131_073].into()),
+        Message::Ping(vec![0, 255, 42].into()),
+    ] {
+        let expected = match &message {
+            Message::Ping(payload) => Message::Pong(payload.clone()),
+            _ => message.clone(),
+        };
+        websocket.send(message).await.unwrap();
+        assert_eq!(websocket.next().await.unwrap().unwrap(), expected);
+    }
+}
+
+async fn protocol_soak_batch(
+    address: std::net::SocketAddr,
+    connector: &tokio_rustls::TlsConnector,
+) {
+    use futures_util::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut clients = tokio::task::JoinSet::new();
+    for client in 0..8 {
+        let connector = connector.clone();
+        clients.spawn(async move {
+            timeout(Duration::from_secs(5), async {
+                if client == 5 || client == 6 {
+                    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+                    if client == 5 {
+                        socket.write_all(b"not a TLS handshake\r\n").await.unwrap();
+                    }
+                    let mut response = Vec::new();
+                    if let Err(error) = socket.read_to_end(&mut response).await {
+                        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+                    }
+                    assert!(!response.windows(5).any(|bytes| bytes == b"HTTP/"));
+                    return;
+                }
+                let mut socket = soak_tls_connect(address, &connector).await;
+                if client == 2 || client == 3 {
+                    let (mut websocket, response) =
+                        tokio_tungstenite::client_async("wss://localhost/ws", socket)
+                            .await
+                            .unwrap();
+                    assert_eq!(response.status(), 101);
+                    soak_websocket_exchange(&mut websocket).await;
+                    if client == 2 {
+                        websocket.close(None).await.unwrap();
+                        assert!(websocket.next().await.unwrap().unwrap().is_close());
+                    }
+                    return;
+                }
+                let request: &[u8] = match client {
+                    1 => b"GET /stream HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    4 => b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: invalid\r\nSec-WebSocket-Version: 13\r\n\r\n",
+                    _ => b"GET /echo HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-Proto: spoof\r\nConnection: close\r\n\r\n",
+                };
+                socket.write_all(request).await.unwrap();
+                let mut response = Vec::new();
+                if let Err(error) = socket.take(262_144).read_to_end(&mut response).await {
+                    assert_eq!(client, 4, "unexpected TLS EOF for client {client}: {error}");
+                    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+                }
+                assert!(response.len() < 262_144);
+                let response = String::from_utf8(response).unwrap();
+                if client == 4 {
+                    assert!(response.starts_with("HTTP/1.1 400"));
+                    let mut headers = [httparse::EMPTY_HEADER; 32];
+                    let mut parsed = httparse::Response::new(&mut headers);
+                    let head_size = parsed.parse(response.as_bytes()).unwrap().unwrap();
+                    let length: usize = parsed.headers.iter()
+                        .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+                        .map(|header| std::str::from_utf8(header.value).unwrap().parse().unwrap())
+                        .unwrap();
+                    assert_eq!(response.len() - head_size, length);
+                } else {
+                    assert!(response.starts_with("HTTP/1.1 200"));
+                    if client == 1 {
+                        assert!(response.contains("data: first\n\n"));
+                        assert!(response.contains("data: last\n\n"));
+                        assert!(response.ends_with("0\r\n\r\n"));
+                    } else {
+                        assert!(response.contains("x-forwarded-proto: https"));
+                        assert!(!response.contains("spoof"));
+                    }
+                }
+            })
+            .await
+            .expect("TLS/WebSocket soak client stalled");
+        });
+    }
+    while let Some(result) = clients.join_next().await {
+        result.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "isolated TLS/WebSocket soak: set DRAGON_SOAK_SECONDS and run with --ignored --exact --nocapture"]
+async fn sustained_tls_websocket_has_bounded_resources() {
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use tokio_rustls::{TlsConnector, rustls};
+    let seconds: u64 = std::env::var("DRAGON_SOAK_SECONDS")
+        .unwrap_or_else(|_| "600".into())
+        .parse()
+        .unwrap();
+    assert!((1..=86_400).contains(&seconds));
+    let directory = tempfile::tempdir().unwrap();
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let certificate = directory.path().join("certificate.pem");
+    let private_key = directory.path().join("private-key.pem");
+    std::fs::write(&certificate, certified.cert.pem()).unwrap();
+    std::fs::write(&private_key, certified.key_pair.serialize_pem()).unwrap();
+    std::fs::write(directory.path().join("finish-stream"), "finish").unwrap();
+    let spec = application_spec("proxy", directory.path());
+    let backend_address = spec.readiness.address;
+    let mut config = hosted_config(spec);
+    config.server.tls = Some(dragon_server::config::Tls {
+        certificate,
+        private_key,
+        handshake_timeout_ms: 200,
+    });
+    config.server.shutdown_timeout_ms = 500;
+    config.limits.response_timeout_ms = 2000;
+    config.limits.idle_timeout_ms = 10_000;
+    config.sites[0].routes[0].streaming = true;
+    config.sites[0].routes[0].websocket = true;
+    let server = dragon_server::server::Server::new(config).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.serve(listener, async {
+        let _ = stopped.await;
+    }));
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certified.cert.der().clone()).unwrap();
+    let connector = TlsConnector::from(Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ));
+    let mut persistent = Vec::new();
+    for _ in 0..2 {
+        let (websocket, response) = timeout(Duration::from_secs(5), async {
+            tokio_tungstenite::client_async(
+                "wss://localhost/ws",
+                soak_tls_connect(address, &connector).await,
+            )
+            .await
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 101);
+        persistent.push(websocket);
+    }
+    for _ in 0..20 {
+        timeout(Duration::from_secs(5), async {
+            for websocket in &mut persistent {
+                soak_websocket_exchange(websocket).await;
+            }
+        })
+        .await
+        .unwrap();
+        protocol_soak_batch(address, &connector).await;
+    }
+    let baseline = support::resource_snapshot();
+    let mut peak = baseline;
+    let started = Instant::now();
+    let mut next_sample = Duration::ZERO;
+    let mut batches = 0;
+    while started.elapsed() < Duration::from_secs(seconds) {
+        timeout(Duration::from_secs(5), async {
+            for websocket in &mut persistent {
+                soak_websocket_exchange(websocket).await;
+            }
+        })
+        .await
+        .unwrap();
+        protocol_soak_batch(address, &connector).await;
+        batches += 1;
+        if started.elapsed() >= next_sample {
+            let current = support::resource_snapshot();
+            peak = (peak.0.max(current.0), peak.1.max(current.1));
+            assert!(
+                current.0 <= baseline.0 + 4,
+                "descriptor growth: {baseline:?} -> {current:?}"
+            );
+            assert!(
+                current.1 <= baseline.1 + 16_384,
+                "RSS growth in KiB: {baseline:?} -> {current:?}"
+            );
+            println!(
+                "TLS/WS soak elapsed={}s batches={batches} descriptors={} rss_kib={}",
+                started.elapsed().as_secs(),
+                current.0,
+                current.1
+            );
+            next_sample += Duration::from_secs(5);
+        }
+    }
+    stop.send(()).unwrap();
+    timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    for mut websocket in persistent {
+        assert!(
+            timeout(Duration::from_secs(2), websocket.next())
+                .await
+                .unwrap()
+                .is_none_or(|message| message.is_err())
+        );
+    }
+    assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    assert!(
+        tokio::net::TcpStream::connect(backend_address)
+            .await
+            .is_err()
+    );
+    let final_resources = support::resource_snapshot();
+    assert!(final_resources.0 <= baseline.0);
+    assert!(final_resources.1 <= baseline.1 + 16_384);
+    println!(
+        "TLS/WS soak PASS seconds={seconds} connections={} persistent_websockets=2 baseline={baseline:?} peak={peak:?} after_shutdown={final_resources:?}",
+        batches * 8
+    );
 }
 
 #[tokio::test]

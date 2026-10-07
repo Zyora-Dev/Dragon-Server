@@ -210,8 +210,9 @@ replace coverage-guided fuzzing, resource-leak measurement or long soak tests.
 GitHub Actions passed formatting, strict Clippy and all 50 regular tests on Ubuntu
 24.04 and macOS 26 ARM64 using Rust 1.89.0 for commit `df736b0` in
 [run 37480435071](https://github.com/Zyora-Dev/Dragon-Server/actions/runs/37480435071).
-The normal runner ignores the separate soak test and one native subprocess
-fixture explicitly invoked by the process tests. See [PROGRESS.md](PROGRESS.md)
+The normal runner ignores the separate HTTP and TLS/WebSocket soak tests, the
+optional Niral smoke, and one native subprocess fixture explicitly invoked by
+the process tests. See [PROGRESS.md](PROGRESS.md)
 for the run evidence. The current suite passes 61 regular tests on macOS, including
 stream delivery before EOF, admission recovery, early WebSocket frames, binary/ping
 echo, shutdown, trusted/untrusted TLS, handshake timeout, secure streaming, WSS
@@ -277,6 +278,24 @@ The test is ignored by normal runs and requires Unix descriptor inspection and `
 RSS covers the test process, including both server and clients; it is not a heap
 leak detector or a throughput benchmark.
 
+Run the hosted TLS/WebSocket resource test separately:
+
+```sh
+DRAGON_SOAK_SECONDS=600 cargo test --locked --test process_integration sustained_tls_websocket_has_bounded_resources -- --ignored --exact --nocapture
+```
+
+It retains two certificate-verified secure WebSockets throughout the campaign,
+checking text, 131,073-byte binary payloads and ping/pong on every batch. Eight
+concurrent clients repeatedly exercise HTTPS forwarding, completed SSE responses,
+secure WebSocket reconnects with clean and abrupt disconnects, invalid upgrades,
+malformed TLS and stalled handshakes. Invalid upgrades must return a complete
+HTTP 400 response; only this rejected request may end without TLS close_notify.
+Twenty warm-up batches precede the same +4 descriptor/+16 MiB RSS budgets and
+five-second sampling used by the HTTP soak. Shutdown must close active tunnels
+and both public/backend listeners and return successful managed-process cleanup.
+Resource samples include Dragon and its in-process test clients, not the child
+backend. This does not measure child-process memory or long-running SSE streams.
+
 Coverage-guided fuzzing uses a separate development-only package:
 
 ```sh
@@ -294,10 +313,17 @@ The manual **Extended validation** GitHub Actions workflow runs these same bound
 campaigns on Linux and retains logs/artifacts for 14 days. Separate Linux jobs
 run the 28 lifecycle/proxy regressions and real Niral production smoke on Node 22
 and 24, with a pinned Niral source revision and no persisted checkout credentials.
+The ten-minute TLS/WebSocket soak runs in its own job; select the `protocols`
+dispatch scope to run only that job, or `all` (the default) for all campaigns.
 These campaigns do not prove leak freedom, exhaustive protocol coverage or
-production readiness. The resource soak covers HTTP/static traffic, not sustained
-managed-process, TLS, streaming-proxy or WebSocket workloads; the fuzzer targets
-ingress, routing and configuration, not the TLS or WebSocket engines.
+production readiness. The fuzzer targets ingress, routing and configuration,
+not the TLS or WebSocket engines. Browser/RPC/Niral-specific WebSocket
+compatibility and sustained child-process resource checks remain unverified.
+
+The TLS/WebSocket soak passed a 60-second macOS run on 2026-10-07: 2,280 measured
+connection attempts plus two persistent secure sockets; descriptors baseline/peak
+19, after shutdown 10; RSS baseline/peak/after 15,296/15,744/15,488 KiB. All 61
+regular tests and strict Clippy passed. The ten-minute Linux protocol run is pending.
 
 For the earlier HTTP foundation on macOS, the five-minute ASan campaign completed 3,555,327 executions without a
 crash or invariant failure. The ten-minute soak passed 61,408 connections:
