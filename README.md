@@ -222,8 +222,8 @@ fuzz campaign. The current implementation at `8ae5188` passed formatting, strict
 all-target Clippy and all 60 Linux / 61 macOS regular tests with Rust 1.89.0 in
 [run 37517562790](https://github.com/Zyora-Dev/Dragon-Server/actions/runs/37517562790).
 Ubuntu 24.04 completed in 54 seconds; macOS completed in 1 minute 28 seconds.
-Extended fuzz/soak was not rerun. Normal runs also ignore the Niral test; its
-real-application smoke result above remains macOS-only.
+The subsequent extended run below covers bounded Linux fuzz/soak and real Niral
+on Node 22 and 24. Normal regression runs still ignore the Niral test.
 
 ### Optional Niral Smoke Test
 
@@ -253,6 +253,11 @@ cleanup for both Niral and the test client. The previous zombie-only macOS
 suppression. Genuine or unverified cleanup errors still prevent replacement.
 This is not complete hosting acceptance.
 The test is ignored in normal CI because Niral and Node are external prerequisites.
+The manual extended workflow supplies those prerequisites: Linux checks passed
+with Node 22.23.3 and 24.21.0 and Niral revision `3bf4d1c`, including clean cleanup.
+It pins the Niral checkout for reproducibility; testing newer runtime revisions
+requires updating that pin. Native protocol tests cover HTTPS and WebSockets,
+but this real Niral smoke uses HTTP and does not test browser hydration or RPC.
 
 ### Extended Validation
 
@@ -286,10 +291,15 @@ progress, path/host normalization and TOML parsing/validation under AddressSanit
 Generated inputs belong in the first, ignored corpus directory; checked-in seeds
 are a separate input directory. Crash artifacts remain under `fuzz/artifacts`.
 The manual **Extended validation** GitHub Actions workflow runs these same bounded
-campaigns on Linux and retains logs/artifacts for 14 days. These campaigns do not
-prove leak freedom, exhaustive protocol coverage or production readiness.
+campaigns on Linux and retains logs/artifacts for 14 days. Separate Linux jobs
+run the 28 lifecycle/proxy regressions and real Niral production smoke on Node 22
+and 24, with a pinned Niral source revision and no persisted checkout credentials.
+These campaigns do not prove leak freedom, exhaustive protocol coverage or
+production readiness. The resource soak covers HTTP/static traffic, not sustained
+managed-process, TLS, streaming-proxy or WebSocket workloads; the fuzzer targets
+ingress, routing and configuration, not the TLS or WebSocket engines.
 
-On macOS, the five-minute ASan campaign completed 3,555,327 executions without a
+For the earlier HTTP foundation on macOS, the five-minute ASan campaign completed 3,555,327 executions without a
 crash or invariant failure. The ten-minute soak passed 61,408 connections:
 descriptors stayed at 12 in all samples and fell to 10 after shutdown; RSS rose
 from a 9,568 KiB baseline to a sampled peak of 10,368 KiB.
@@ -297,6 +307,16 @@ On Ubuntu 24.04.5, the five-minute ASan campaign passed 2,687,267 executions;
 the ten-minute soak passed 61,888 connections. Descriptors stayed at 14 in all
 samples and fell to 12 after shutdown; RSS rose from 10,672 KiB to a sampled
 peak of 11,904 KiB. See [PROGRESS.md](PROGRESS.md) for evidence and remaining limits.
+
+The current implementation at `9982a24` passed Linux
+[run 37560734013](https://github.com/Zyora-Dev/Dragon-Server/actions/runs/37560734013):
+2,890,393 ASan fuzz executions in the five-minute campaign, without a crash or
+invariant failure (414 MiB peak instrumented-fuzzer RSS). The 600-second soak
+passed 62,432 connections; descriptors stayed at 14 and fell to 12 after shutdown.
+RSS baseline/peak/after-shutdown was 14,780/16,448/16,020 KiB, within the configured
+budget. Both Node compatibility jobs passed all 28 native tests plus real Niral
+SSR/assets/404/readiness and clean shutdown. Evidence artifacts expire after
+14 days; these results do not establish a throughput benchmark or production SLA.
 
 ## Current Boundaries
 
